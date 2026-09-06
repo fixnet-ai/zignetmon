@@ -14,11 +14,15 @@
 //! 「是否变化」（gateway / 默认接口身份 / DNS 列表 / 接口属性），但只作
 //! **变更门控 + ZF_NETWORK_TRACE 诊断**，不产出多 kind 事件。
 //!
-//! ## 门面级 1s 合并去抖（design.md §6 验收）
-//! dispatch() 内以 `zf.platform.monoNanos` 距上次派发 <1s 为门控：本次**不派发**
-//! （合并；内部快照保持最新，供下次派发 / 主动 snapshot() 承载）。目的：**同一逻辑
-//! 变化被多个事件源各报一次**时（如「接口+DNS 同时变」→ network 与 dns_monitor
-//! 各触发一次；hosts/proxy 事件源自身的重复触发）收敛为恰好一次粗回调。
+//! ## 门面级 1s 合并去抖（design.md §6 验收；范围 = 仅 network/dns_monitor）
+//! 目的：**同一链路切换的连通性 state 被两个重叠观测源各报一次**（如「接口+DNS 同时变」
+//! → network 与 dns_monitor 各触发一次）收敛为恰好一次粗回调。故 1s 合并**仅对
+//! network / dns_monitor 事件生效**（二者都观测连通性，互相同变合并）。
+//!
+//! hosts / proxy 是**独立去重源**（内容 diff 后才 emit，各自绝不重复上报同一变化），
+//! 其事件**必达**（不参与 1s 合并）：否则紧跟在一次无关派发（如 hosts 恢复回调）之后
+//! <1s 到达的代理变化会被误合并丢弃且永不补发 → 消费方漏掉一次真实变化
+//! （Windows real_event 真机残留 bug 根因，见 task_plan）。
 //!
 //! ## 基线（baseline）语义
 //! 首个 network 事件仅建立基线（不派发），避免消费方在 start 时收到一次
@@ -283,8 +287,10 @@ pub const Monitor = struct {
     prev_valid: bool = false,
     prev_facts: Facts = .{},
 
-    /// 上次粗派发时刻（monoNanos，纳秒）。0 = 从未派发（首次必派发）；
-    /// dispatch() 内做 1s 合并去抖门控（见文件头）。
+    /// 上次**合并类**（network/dns_monitor）粗派发时刻（monoNanos，纳秒）。
+    /// 0 = 从未派发（首次必派发）。仅 network/dns_monitor 派发更新本时钟；
+    /// hosts/proxy 派发不更新（二者为独立去重源，必达且不参与合并，见文件头）。
+    /// dispatch() 内做合并门控。
     last_dispatch_ns: i64 = 0,
 
     subs: [MaxSubscribers]Subscriber = undefined,
@@ -451,7 +457,9 @@ pub const Monitor = struct {
 
         if (!d.any()) return; // 相同事件去重
         const snap = self.assembleFrom(info);
-        self.dispatch(&snap); // 粗信号：network diff 任一字段非空 → 恰好一次派发
+        // 粗信号：network diff 任一字段非空 → 派发。mergeable=true：network 与
+        // dns_monitor 重叠观测连通性，二者互相同变 <1s 时收敛为一次（见文件头）。
+        self.dispatch(&snap, true);
     }
 
     fn handleHosts(self: *Monitor, mtime: i128) void {
@@ -459,7 +467,9 @@ pub const Monitor = struct {
         const snap = self.currentSnapshot();
         var s = snap;
         s.hosts_mtime = mtime; // 事件时间戳（保证与回调一致）
-        self.dispatch(&s); // hosts 变化 → 一次粗回调
+        // hosts 变化 → 粗回调。mergeable=false：hosts 为独立去重源（内容 diff 后才
+        // emit），真实变化必达，不参与 1s 合并（见文件头）。
+        self.dispatch(&s, false);
     }
 
     fn handleProxy(self: *Monitor, settings: *const proxy_monitor.ProxySettings) void {
@@ -471,7 +481,11 @@ pub const Monitor = struct {
             }
         }
         const snap = self.currentSnapshot();
-        self.dispatch(&snap); // proxy 变化 → 一次粗回调
+        // proxy 变化 → 粗回调。mergeable=false：proxy 为独立去重源（内部读注册表 +
+        // settingsEqual diff 后才 emit），真实变化必达，不参与 1s 合并（见文件头）。
+        // 否则紧跟在一次无关派发（如 hosts 恢复回调）之后 <1s 到达的代理变化会被
+        // 误合并丢弃且永不补发 → 消费方漏报（Windows real_event 真机残留 bug 根因）。
+        self.dispatch(&snap, false);
     }
 
     /// dns_monitor 回调：系统 DNS 在路由/网卡未变时被单独修改（第 4 子监测）。
@@ -484,31 +498,36 @@ pub const Monitor = struct {
         }
         var snap = self.currentSnapshot();
         snap.dns_servers = settings.servers; // 覆盖新鲜值（快照借用 settings 内部缓冲，回调期有效）
-        self.dispatch(&snap); // DNS 独立变化 → 一次粗回调（受 1s 合并去抖门控）
+        // DNS 独立变化 → 粗回调。mergeable=true：与 network 同为连通性重叠观测源，
+        // 二者互相同变 <1s 时收敛为一次（见文件头）；hosts/proxy 介入不重置本时钟。
+        self.dispatch(&snap, true);
     }
 
     // ---- 派发 ----
 
     /// 派发「网络变了」粗信号：任一类底层变化恰好派发一次（design.md §5/§6）。
     ///
-    /// 带**门面级 1s 合并去抖**：距上次派发 <1s 则本次合并不派发（快照仍保持最新，
-    /// 供下次派发 / 主动 snapshot() 承载）。首派发（last_dispatch_ns == 0）必发。
-    /// 目的：同一逻辑变化被多个事件源各报一次（network + dns_monitor / hosts / proxy）
-    /// 时收敛为恰好一次粗回调，消费方不会在亚秒内被同一变化连轰多次。
-    fn dispatch(self: *Monitor, snap: *const Snapshot) void {
+    /// 1s 合并去抖**仅对 mergeable 事件**（network/dns_monitor，连通性重叠观测源）
+    /// 生效：距上次 mergeable 派发 <1s 则本次合并不派发（快照仍保持最新，供下次
+    /// 派发 / 主动 snapshot() 承载）。首派发（last_dispatch_ns == 0）必发。
+    /// hosts/proxy 事件 mergeable=false：真实变化必达（内部已内容 diff 去重），
+    /// 不参与合并也不重置 last_dispatch_ns 时钟——保证独立去重源的真实变化永远
+    /// 不被门面误合并丢弃（见文件头「门面级 1s 合并去抖」）。
+    fn dispatch(self: *Monitor, snap: *const Snapshot, mergeable: bool) void {
         const now = zf.platform.monoNanos();
 
         self.mutex.lock();
         const last = self.last_dispatch_ns;
-        if (last != 0 and (now - last) < MergeWindowNs) {
-            // 合并：距上次派发 <1s，本次不派发（同一/相邻逻辑变化被多源重复上报）。
+        if (mergeable and last != 0 and (now - last) < MergeWindowNs) {
+            // 合并：距上次 mergeable 派发 <1s（同一链路切换被 network/dns_monitor
+            // 重复上报），本次不派发。
             self.mutex.unlock();
             if (traceEnabled()) {
-                std.log.info("[monitor] dispatch merged (<1s since last, snapshot stays fresh)", .{});
+                std.log.info("[monitor] dispatch merged (<1s since last connectivity dispatch, snapshot stays fresh)", .{});
             }
             return;
         }
-        self.last_dispatch_ns = now;
+        if (mergeable) self.last_dispatch_ns = now;
         const n = self.sub_count;
         if (n > 0) @memcpy(self.emit_scratch[0..n], self.subs[0..n]);
         self.mutex.unlock();

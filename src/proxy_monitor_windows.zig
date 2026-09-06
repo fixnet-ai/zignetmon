@@ -7,7 +7,9 @@
 //!   - `AutoConfigURL`(REG_SZ)：PAC 自动配置脚本 URL（无法表示为 host:port → disabled）。
 //!
 //! 本后端用 **RegNotifyChangeKeyValue**（advapi32，异步 + 事件）监听上述 key 变化，
-//! 后台线程 WaitForMultipleObjects 阻塞等待（非忙等），变化 → 重读当前值 → diff → emit。
+//! 后台线程 WaitForMultipleObjects **有界阻塞等待**（非忙等）：事件驱动为主，事件
+//! 丢失/未投递/注册失败时以 PollIntervalMs 超时兜底重读注册表做 diff（去重幂等，
+//! 不变不 emit），保证真实变化不被永久漏报（真机验证曾现 0 CHANGED，故加周期兜底）。
 //! 事件驱动：Registry 写后同步到已打开 key 句柄的异步 notify（与 SCDynamicStore 同思路）。
 //!
 //! ⚠️ 平台说明：本文件仅 Windows 目标编译/运行；已用 x86_64-windows 交叉编译验证
@@ -53,7 +55,10 @@ const ERROR_FILE_NOT_FOUND: i32 = 2;
 
 // 等待常量
 const WAIT_OBJECT_0: u32 = 0;
-const INFINITE: u32 = 0xFFFFFFFF;
+const WAIT_TIMEOUT: u32 = 0x00000102;
+/// 有界等待超时：RegNotifyChangeKeyValue 为**单次注册**，事件丢失/未投递时若无限
+/// 阻塞会永久漏报；超时兜底重读注册表 diff（去重幂等，不重复 emit），自愈漏报。
+const PollIntervalMs: u32 = 1000;
 
 const advapi32 = struct {
     extern "advapi32" fn RegOpenKeyExW(
@@ -220,24 +225,35 @@ pub const Impl = struct {
 
     fn notifyLoop(self: *Impl) void {
         var handles = [_]HANDLE{ self.change_evt, self.stop_evt };
+        var notify_down: bool = false;
         while (!self.stop.load(.acquire)) {
-            // re-arm：异步 notify 每次事件后需重新调用（先重置事件再注册）。
+            // re-arm：异步 notify 为单次注册，每次事件/超时后重新调用（先清事件再注册；
+            // ResetEvent→注册 之间存在竞态窗口，由下方周期兜底自愈，不依赖事件万无一失）。
             _ = kernel32.ResetEvent(handles[0]);
             const rn = advapi32.RegNotifyChangeKeyValue(
                 self.hkey.?,
-                0, // 不递归子树（该 key 的直接值变化足够）
+                1, // 递归子树：值写在该 key 或其子键均触发（对齐 dns_monitor_windows 与 MS 示例）
                 REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
                 handles[0],
                 1, // 异步：由事件通知
             );
             if (rn != ERROR_SUCCESS) {
-                std.log.warn("[proxy] win monitor: RegNotifyChangeKeyValue failed rc={d}, stop", .{rn});
-                return;
+                // 注册失败**不停线程**：退化为有界等待 + 周期重读 diff，仍能感知变化。
+                if (!notify_down) {
+                    notify_down = true;
+                    std.log.warn("[proxy] win monitor: RegNotifyChangeKeyValue failed rc={d}, fallback to periodic diff", .{rn});
+                }
+            } else if (notify_down) {
+                notify_down = false;
             }
-            const w = kernel32.WaitForMultipleObjects(handles.len, &handles, 0, INFINITE);
+            // 有界等待（非忙等）：事件驱动为主；每次超时兜底重读注册表 diff——
+            // 事件丢失/未投递/注册失败都不再永久漏报（diff 去重幂等，不变不 emit）。
+            const w = kernel32.WaitForMultipleObjects(handles.len, &handles, 0, PollIntervalMs);
             if (w == WAIT_OBJECT_0) {
                 std.log.info("[proxy] win: Internet Settings changed", .{});
                 self.refresh(true);
+            } else if (w == WAIT_TIMEOUT) {
+                self.refresh(true); // 周期兜底：相等则无 diff，不 emit
             } else {
                 // stop 事件（w == WAIT_OBJECT_0+1）→ 退出循环
                 return;

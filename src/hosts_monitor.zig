@@ -4,8 +4,11 @@
 //! 用户/杀毒/代理工具修改它会影响 DNS 解析结果。本模块轮询监测该文件，内容变化时
 //! 以回调通知上层（mtime 纳秒时间戳）。
 //!
-//! 架构：后台线程每 5s（可调）对文件做一次 stat（mtime + size），与上次基线比对，
-//! 仅当确实变化才 emit；空路径（iOS/Android，hosts 文件非本机用户可改）start 直接 no-op。
+//! 架构：后台线程每 5s（可调）对文件做一次 stat（mtime + size）作预筛，stat 变化时
+//! 重读内容做**内容 diff 确认**——字节真变才 emit。同内容周期重写（守护进程保活
+//! touch，如 linuxvm utm-monitor 每 ~30s 重写 /etc/hosts）只 bump mtime、不改 hosts
+//! 映射，不产生伪「网络变了」信号（见 pollOnce）；空路径（iOS/Android，hosts 文件
+//! 非本机用户可改）start 直接 no-op。
 //!
 //! 数据面说明：本模块是低频轮询监测（非代理数据热路径），允许后台线程 + 阻塞 stat，
 //! 但禁止忙等 —— 每轮用 `zf.platform.sleepNs` 分片睡眠（非忙等）。
@@ -27,6 +30,10 @@ const DefaultPollIntervalNs: u64 = 5 * std.time.ns_per_s;
 
 /// 睡眠分片：100ms。保证 close() 停线程延迟 ≤ ~100ms，同时非忙等。
 const SleepTickNs: u64 = 100 * std.time.ns_per_ms;
+
+/// hosts 内容读取上限（4 MiB，远超正常 hosts 规模；超限读失败 → 见 pollOnce 的
+/// fail-open 分支，宁多报不漏报真变化，防恶意/异常巨型 hosts 撑爆读取缓冲）。
+const MaxHostsBytes: usize = 4 * 1024 * 1024;
 
 /// 订阅者上限（回调注册表容量）。hosts 监测属低频事件，实际消费者通常仅门面 1 个。
 const MaxSubscribers: usize = 16;
@@ -72,6 +79,9 @@ pub const HostsMonitor = struct {
     last_mtime: ?i128 = null,
     /// 变更检测的 size 基线。
     last_size: u64 = 0,
+    /// 最近一次观测到的文件内容（owned，allocator 分配）；null = 尚无内容基线。
+    /// 变更判定以内容 diff 为准（见 pollOnce），stat mtime 仅作预筛 + 快照时间戳。
+    last_content: ?[]u8 = null,
     /// 订阅者注册表（回调链表语义）。
     subs: [MaxSubscribers]Subscriber = undefined,
     sub_count: usize = 0,
@@ -133,6 +143,8 @@ pub const HostsMonitor = struct {
     /// 释放资源：先停线程（幂等，内部处理未 close 情形），再释放 dup 的 path。
     pub fn deinit(self: *HostsMonitor) void {
         self.close();
+        if (self.last_content) |c| self.allocator.free(c);
+        self.last_content = null;
         self.allocator.free(self.path);
         self.path = &.{};
     }
@@ -157,8 +169,15 @@ pub const HostsMonitor = struct {
         }
     }
 
-    /// 单轮 stat diff：mtime + size 任一变化才 emit。每次成功 stat 都会刷新
-    /// last_mtime（供上层 snapshot 读取当前文件状态），仅「相对上次变化」时发事件。
+    /// 单轮轮询：stat 预筛 + **内容 diff 确认**。stat（mtime + size）相对上次基线变化
+    /// 只是「可能变化」；须重读内容、与上次内容基线比对，**字节真变才 emit**。
+    ///
+    /// 原因（bug1 root cause，linuxvm 实测）：守护进程周期重写 hosts 文件但内容不变
+    /// （utm-monitor 每 ~30s 对 /etc/hosts 做保活重写，md5 恒定、仅 mtime bump）。纯
+    /// stat-diff 会把这些「同内容重写」误报为变化 → 门面误发「网络变了」粗信号（消费方
+    /// 被无故打断）。内容 diff 后：同内容重写只刷新 stat 基线、不发事件；真内容变化
+    /// （改域名映射 / 换长度）仍恰报一次。每次成功读都刷新 last_mtime/last_size（供
+    /// 上层 snapshot 读取当前文件状态）。
     fn pollOnce(self: *HostsMonitor, io: std.Io) void {
         const st = std.Io.Dir.cwd().statFile(io, self.path, .{}) catch |err| {
             // 文件暂不可读（不存在/权限/正在被替换）：保留上次状态，等下一轮。
@@ -167,20 +186,69 @@ pub const HostsMonitor = struct {
         };
         const mtime: i128 = @intCast(st.mtime.nanoseconds);
 
-        var changed = false;
+        // stat 预筛：与上次基线一致 → 内容必未变（写入必更新 mtime），免读快速路径。
+        var stat_changed = false;
+        var have_baseline = false;
         self.mutex.lock();
         if (self.last_mtime) |prev| {
-            // 已有基线：mtime 或 size 任一变化即视为内容变化。
-            changed = (mtime != prev) or (st.size != self.last_size);
-        } else {
-            std.log.debug("[hosts] baseline established mtime={d} size={d}", .{ mtime, st.size });
+            have_baseline = true;
+            stat_changed = (mtime != prev) or (st.size != self.last_size);
         }
-        // 无论是否变化都刷新基线（供上层 snapshot 读取当前文件状态）。
+        self.mutex.unlock();
+
+        if (have_baseline and !stat_changed) return; // 无变化，无需读内容
+
+        // stat 变化（或首轮建基线）：读当前内容做内容 diff 确认。
+        const content = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(MaxHostsBytes)) catch |err| {
+            // 读失败（瞬时被替换/权限/超限）：无法核对内容。首轮建基线失败 → 放弃、下轮
+            // 重试（last_mtime 保持 null）；已有基线且 stat 变化 → 无法排除真变化，
+            // fail-open 按变化 emit（宁多报不漏报真变化）。
+            if (have_baseline) {
+                std.log.debug("[hosts] read failed err={s}; stat changed, fail-open emit", .{@errorName(err)});
+                self.mutex.lock();
+                self.last_mtime = mtime;
+                self.last_size = st.size;
+                self.mutex.unlock();
+                std.log.info("[hosts] hosts file changed mtime={d} size={d} (read-fail open)", .{ mtime, st.size });
+                self.emit(mtime);
+            } else {
+                std.log.debug("[hosts] initial read failed err={s}, retry next poll", .{@errorName(err)});
+            }
+            return;
+        };
+
+        var content_taken = false;
+        var do_emit = false;
+        self.mutex.lock();
+        if (have_baseline) {
+            if (self.last_content) |prev| {
+                if (!std.mem.eql(u8, prev, content)) {
+                    do_emit = true;
+                    content_taken = true;
+                }
+                // 同内容重写（mtime bump only）：不 emit、不换内容基线。
+            } else {
+                // 有 stat 基线但内容基线缺失（历史读失败遗留）→ 保守按变化。
+                do_emit = true;
+                content_taken = true;
+            }
+        } else {
+            // 首轮成功读：建立 stat + 内容基线，不发事件（同旧 stat-diff 基线语义）。
+            std.log.debug("[hosts] baseline established mtime={d} size={d}", .{ mtime, st.size });
+            content_taken = true;
+        }
+        if (content_taken) {
+            if (self.last_content) |old| self.allocator.free(old);
+            self.last_content = content;
+        } else {
+            self.allocator.free(content);
+            std.log.debug("[hosts] rewrite identical content (mtime bump only), no emit", .{});
+        }
         self.last_mtime = mtime;
         self.last_size = st.size;
         self.mutex.unlock();
 
-        if (changed) {
+        if (do_emit) {
             std.log.info("[hosts] hosts file changed mtime={d} size={d}", .{ mtime, st.size });
             self.emit(mtime);
         }
@@ -349,6 +417,45 @@ test "hosts_monitor: hosts 内容变化触发 stat diff 回调" {
     ctx.mutex.unlock();
     try testing.expect(fired_mtime > 0);
     try testing.expectEqual(fired_mtime, mon.lastMtime().?); // 回调 mtime = 快照 mtime
+}
+
+test "hosts_monitor: 同内容重写（仅 mtime bump）不触发，真内容变化仍触发" {
+    // bug1 回归（linuxvm 实测）：守护进程周期重写 hosts 但内容字节不变（utm-monitor
+    // 每 ~30s 对 /etc/hosts 保活重写，md5 恒定），只 bump mtime、不改映射 —— 不得
+    // 误发「网络变了」粗信号。阳性对照：随后真内容变化（长度不同）仍恰好触发一次。
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const content = "127.0.0.1 localhost\n192.0.2.1 example.test\n";
+    var hosts = try makeTmpHosts(io, testing.allocator, content);
+    defer hosts.tmp.cleanup();
+    defer testing.allocator.free(hosts.path);
+
+    var ctx = TestCtx{};
+    var mon = try HostsMonitor.init(testing.allocator, hosts.path);
+    defer mon.deinit();
+    mon.poll_interval_ns = 40 * std.time.ns_per_ms; // 测试下调轮询间隔
+
+    try mon.subscribe(onHostsChange, &ctx);
+    try mon.start();
+
+    // 等基线建立（首轮成功读内容建基线，不发事件）
+    try testing.expect(waitUntil(baselineReady, @ptrCast(&mon), 2 * std.time.ns_per_s));
+    try testing.expect(!firedFlag(@ptrCast(&ctx)));
+
+    // 同内容重写：等一小段（> 文件系统时间戳粒度，确保 mtime 确实推进）后写完全相同字节。
+    zf.platform.sleepNs(60 * std.time.ns_per_ms);
+    try hosts.tmp.dir.writeFile(io, .{ .sub_path = "hosts", .data = content });
+
+    // 多轮 poll（≥ 10 个轮询周期）内不得触发回调。
+    zf.platform.sleepNs(600 * std.time.ns_per_ms);
+    try testing.expect(!firedFlag(@ptrCast(&ctx)));
+
+    // 阳性对照：真内容变化（长度不同 → 内容 diff 必检出）仍触发。
+    const changed_content = content ++ "10.0.0.1 internal.local\n";
+    try hosts.tmp.dir.writeFile(io, .{ .sub_path = "hosts", .data = changed_content });
+    try testing.expect(waitUntil(firedFlag, @ptrCast(&ctx), 2 * std.time.ns_per_s));
 }
 
 test "hosts_monitor: lastMtime 随内容变化刷新" {
