@@ -1,10 +1,12 @@
 project: zignetmon
 id: 7ce2e3de-5e35-4a22-b7c4-b2a4412a633c
-description: "网络变化监测与自适应库 — 五类事件 × 五平台事件源监测与归一化"
+description: "网络变化监测与自适应库 — 桌面五类/移动粗信号事件源监测与归一化（design.md v2）"
 
-# zignetmon 是纯库（无守护进程/插件对端），测试全部经 zig build test 单测执行，
-# 不依赖 local-echo / sing-box / xray-core 插件。
-# unit 层 counts：54/54（2026-09-07 实测；增删测试后同步注释即可，未设硬阈值护栏）。
+# zignetmon 是纯库（无守护进程/插件对端）。测试分层（design.md §6）：
+#   Tier1 单元/注入 —— host 本机经 zig build test（unit/all-tests，55/55，含 injectPlatformInfo 注入路径）
+#   Tier2 真实事件源 —— macvm/linuxvm/windowsvm 驱动 tests/scripts/*_real_event.{sh,ps1}，
+#        经 vm-regression 白名单在对应 VM 上执行（本机 functional 不启用，见下方占位注释）
+#   Tier3 移动注入   —— iOS/Android 无 hosts/系统代理能力，走注入单测（已含于 unit/all-tests）
 settings:
   build_command: "zig build"
 
@@ -18,18 +20,47 @@ levels:
       timeout: 180
 
   functional:
-    # ⬇⬇⬇ 真实事件源占位（待 macvm，勿在本机启用）⬇⬇⬇
-    # 真实事件源测试需要改宿主网络状态（macOS sudo route 加删 TEST-NET 路由 →
-    # AF_ROUTE 事件 → network 门面回调 → 语义 diff），属特权操作，仅授权 macvm
-    # （同 zigbox tun-scenarios 先例：sudo: true，sudo 不可用自动 SKIP）。
-    # 脚本置 tests/ 下，register 后取消注释即可接入：
+    # ⬇⬇⬇ 真实事件源占位（Tier2，勿在本机启用）⬇⬇⬇
+    # 真实事件源测试需改宿主网络状态（route / resolv / hosts / 系统代理）+ root 特权，
+    # 且 hosts/proxy 在各平台分别驱动 stat diff / RegNotify 等真实 OS 事件 —— 属特权操作，
+    # 仅授权各自 VM（macvm / linuxvm / windowsvm），同 zigbox tun-scenarios 先例（sudo: true，
+    # sudo 不可用自动 SKIP）。前置先构建订阅 harness：zig build real_event →
+    # zig-out/bin/real_event（tests/real_event_harness.zig，每次粗回调打一行 CHANGED）。
     #
-    # - name: "net-event"
-    #   command: "python3 tests/test_net_event.py"
-    #   target: zignetmon   # 采真实被测进程（触发脚本另跑），非 python 驱动本身
-    #   timeout: 120
-    #   parser: line_count
-    #   sudo: true          # macOS sudo route 特权；sudo 不可用自动 SKIP（仅 macvm 执行）
+    # 驱动脚本（nohup 自愈、平台门禁自 SKIP —— 本机误跑安全）：
+    #   macvm     tests/scripts/macos_real_event.sh      [route] sudo route 加删 TEST-NET / [hosts]
+    #   linuxvm   tests/scripts/linux_real_event.sh      [route] ip route / [resolv] / [hosts]
+    #   windowsvm tests/scripts/windows_real_event.ps1   [route] netsh(INFO) / [hosts] / [proxy] RegNotify
+    #
+    # 接入方式：三 VM 脚本挂 vm-regression 白名单调度（zigbox tests/vm/vm-regression.sh 先例）。
+    # 各 VM 对应的 zigtester 套件占位（register 后取消注释，且仅经 vm-regression 在 VM 上启用）：
+    #
+    # - name: "net-event-macos"
+    #   command: "tests/scripts/macos_real_event.sh"
+    #   target: zignetmon    # 采集 harness/被测进程产物，非 python 驱动本身
+    #   timeout: 240
+    #   parser: exit_code
+    #   sudo: true           # macOS sudo route + 写 /etc/hosts；sudo 不可用自动 SKIP
     #   env:
-    #     ZF_NETWORK_TRACE: "1"  # 全流程 info 日志，断言事件处理链
-    #   description: "真实网络事件源：sudo route 加删 TEST-NET 路由 → AF_ROUTE → 归一化 diff → 语义事件"
+    #     ZF_NETWORK_TRACE: "1"   # 全流程 info 日志，断言事件处理链
+    #   description: "macvm 真实事件源：route/hosts 变化 → Monitor 粗回调 ≥1 行 CHANGED"
+    #
+    # - name: "net-event-linux"
+    #   command: "tests/scripts/linux_real_event.sh"
+    #   target: zignetmon
+    #   timeout: 240
+    #   parser: exit_code
+    #   sudo: true           # ip route + 写 /etc/{resolv.conf,hosts}；无 root/sudo 自动 SKIP
+    #   env:
+    #     ZF_NETWORK_TRACE: "1"
+    #   description: "linuxvm 真实事件源：route/resolv/hosts 变化 → Monitor 粗回调 ≥1 行 CHANGED"
+    #
+    # - name: "net-event-windows"
+    #   command: "powershell -ExecutionPolicy Bypass -File tests/scripts/windows_real_event.ps1"
+    #   target: zignetmon
+    #   timeout: 300
+    #   parser: exit_code
+    #   description: "windowsvm 真实事件源：hosts/代理(RegNotify) 强制 + route 仅驱动(INFO)"
+    #
+    # iOS/Android 不设真实事件套件：无 hosts/系统代理能力，监测入口为上层注入
+    # （injectPlatformInfo 模拟 NE/JNI 桥）→ Tier3，已含于 unit/all-tests 注入单测。

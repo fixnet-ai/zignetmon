@@ -33,4 +33,24 @@ pub fn build(b: *std.Build) void {
     test_run.skip_foreign_checks = true;
     const test_step = b.step("test", "运行所有单元测试");
     test_step.dependOn(&test_run.step);
+
+    // ---- Tier2 VM 真事件订阅 harness（测试工具二进制，design.md §6；见 tests/real_event_harness.zig）----
+    // 仅用于 macvm/linuxvm/windowsvm 真事件验证：订阅 Monitor 粗回调 → 每事件向 stdout 打印
+    // 一行 CHANGED iface=... gw=...，运行满 argv[1] 秒后退出 0（运行会阻塞订阅，不并入构建门禁）。
+    const real_event_mod = b.createModule(.{
+        .root_source_file = b.path("tests/real_event_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // stdout std.c.write + Monitor 后台线程（POSIX pthread）
+    });
+    real_event_mod.addImport("zigfoundation", zf_dep.module("zigfoundation"));
+    real_event_mod.addImport("zignetmon", zignetmon_module);
+
+    const real_event = b.addExecutable(.{
+        .name = "real_event",
+        .root_module = real_event_mod,
+    });
+    b.installArtifact(real_event); // 并入默认 `zig build` 安装
+    const real_event_step = b.step("real_event", "构建真事件订阅 harness 到 zig-out/bin/real_event");
+    real_event_step.dependOn(&b.addInstallArtifact(real_event, .{}).step);
 }

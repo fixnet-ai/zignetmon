@@ -1,19 +1,24 @@
-//! zignetmon — 网络变化监测与自适应库（统一语义事件门面）
+//! zignetmon — 网络变化监测与自适应库（「网络变了」粗信号门面，design.md v2）
 //!
 //! 覆盖「路由 / 系统 DNS / 任意网卡 / 系统代理 / hosts 文件」五类关键网络设置变化
 //! × 五平台（macOS / Windows / Linux / iOS / Android）的事件源监测与归一化。
 //!
-//! 本文件是 **归一化层（门面）**（design.md §4 ②）：订阅三个子监测（network /
-//! hosts_monitor / proxy_monitor）的裸事件，比对缓存快照 → diff → 映射为 6 值
-//! ChangeKind 语义事件，以统一 Callback(kind, Snapshot) 派发给决策层（消费方）。
+//! 本文件是 **归一化层（门面）**（design.md §4 ②）：订阅四个子监测（network /
+//! hosts_monitor / proxy_monitor / dns_monitor）的裸事件，比对缓存快照 → diff → 收敛为
+//! 「网络变了」**一个粗信号**，以统一 Callback(Snapshot) 派发给决策层（消费方）。
+//! 消费方不区分「路由 / DNS / 代理哪个变了」，收到即重置依赖网络的状态。
 //!
-//! ## 语义映射（design.md §5.4）
-//! 收到 network 回调（NetworkInfo）与上次缓存快照 diff：
-//!   - gateway 变化            → ChangeKind.route
-//!   - 默认接口身份变化（含无→有/有→无）→ ChangeKind.default_route
-//!   - DNS 列表变化             → ChangeKind.dns
-//!   - 同接口属性变化（mtu/up/地址）  → ChangeKind.interface
-//! hosts / proxy 子监测回调 → ChangeKind.hosts / ChangeKind.proxy。
+//! ## 变更门控（v2：粗信号，design.md §5/§6 验收）
+//! 任一类底层变化（network diff 非空 / hosts mtime 变 / proxy 设置变 / DNS 独立变）→
+//! 派发**恰好一次**粗回调 dispatch(snapshot)。network diff 内部仍按字段判定
+//! 「是否变化」（gateway / 默认接口身份 / DNS 列表 / 接口属性），但只作
+//! **变更门控 + ZF_NETWORK_TRACE 诊断**，不产出多 kind 事件。
+//!
+//! ## 门面级 1s 合并去抖（design.md §6 验收）
+//! dispatch() 内以 `zf.platform.monoNanos` 距上次派发 <1s 为门控：本次**不派发**
+//! （合并；内部快照保持最新，供下次派发 / 主动 snapshot() 承载）。目的：**同一逻辑
+//! 变化被多个事件源各报一次**时（如「接口+DNS 同时变」→ network 与 dns_monitor
+//! 各触发一次；hosts/proxy 事件源自身的重复触发）收敛为恰好一次粗回调。
 //!
 //! ## 基线（baseline）语义
 //! 首个 network 事件仅建立基线（不派发），避免消费方在 start 时收到一次
@@ -25,8 +30,8 @@
 //! 缓冲的**借用**，仅在下一次对应事件前有效；消费方需持久使用时自行拷贝。
 //!
 //! ## 线程模型
-//! network / hosts / proxy 回调各在自己的后台线程触发；门面内部订阅注册表与
-//! 快照基线用 `zf.sync.Mutex` 保护，回调在锁外派发（避免重入死锁）。
+//! network / hosts / proxy / dns 回调各在自己的后台线程触发；门面内部订阅注册表、
+//! 快照基线与派发时间门控用 `zf.sync.Mutex` 保护，回调在锁外派发（避免重入死锁）。
 //!
 //! ## 可观测（design.md §5.5）
 //! `ZF_NETWORK_TRACE=1` 开启 info 级全流程日志（事件源 → diff → 分发），默认关。
@@ -34,7 +39,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zf = @import("zigfoundation");
-const types = @import("types.zig");
 const ntypes = @import("network_types.zig"); // 仅门面内部（Facts 物化）引用
 
 /// 网络门面（单例 + 回调 + 快照）。移植自 zf.network（#43）。
@@ -49,8 +53,9 @@ pub const hosts_monitor = @import("hosts_monitor.zig");
 /// 系统代理变化监测（分平台）。
 pub const proxy_monitor = @import("proxy_monitor.zig");
 
-/// 语义事件类型（六值，见 design.md §5.1）。
-pub const ChangeKind = types.ChangeKind;
+/// 系统 DNS 变化监测（分平台；第 4 子监测）。设计.md §3「DNS」行的独立变化
+/// 承载（路由/网卡未变时 DNS 单独被改）。
+pub const dns_monitor = @import("dns_monitor.zig");
 
 /// 归一化快照 — 回调携带 + `snapshot()` 主动查询共用。
 /// 字段为借用（见文件头「Snapshot 所有权」）。
@@ -62,8 +67,10 @@ pub const Snapshot = struct {
     hosts_mtime: ?i128 = null,
 };
 
-/// 统一语义事件回调：kind 指示哪一类变化，snap 为变化后全量快照。
-pub const Callback = *const fn (kind: ChangeKind, snap: *const Snapshot, ctx: ?*anyopaque) void;
+/// 网络变化回调（v2 粗信号契约，design.md §5）：收到即「网络环境已变」，
+/// 消费方应重置自身依赖网络的状态。snap 为变化后的当前状态快照（借用，
+/// 仅在下一次变化前有效；需持久使用时自行拷贝字段）。
+pub const Callback = *const fn (snap: *const Snapshot, ctx: ?*anyopaque) void;
 
 /// 门面可选项。
 pub const Opt = struct {
@@ -106,7 +113,8 @@ const Facts = struct {
     dns_len: usize = 0,
 };
 
-/// 一次 network diff 的语义结果（不含 hosts/proxy，二者走独立回调）。
+/// 一次 network diff 的字段级结果（v2 内部诊断 + 变更门控，非消费方契约；
+/// 不含 hosts/proxy，二者走独立回调）。消费方只收「网络变了」粗信号。
 const Diff = struct {
     route: bool = false,
     interface: bool = false,
@@ -200,8 +208,9 @@ fn diffFacts(prev: *const Facts, cur: *const Facts) Diff {
     return d;
 }
 
-/// 门面 diff 纯函数（可单测）：比较两个 NetworkInfo 快照 → 语义 diff。
-/// 不依赖 network 单例状态，任何两个快照均可判定。
+/// 门面 diff 纯函数（可单测）：比较两个 NetworkInfo 快照 → 字段级 diff。
+/// 不依赖 network 单例状态，任何两个快照均可判定。「哪类字段变了」仍可判别，
+/// 消费方据此 trace 诊断；派发层面统一收敛为一次粗回调。
 fn classifyNetworkChange(prev: *const network.NetworkInfo, cur: *const network.NetworkInfo) Diff {
     const a = factsOf(prev);
     const b = factsOf(cur);
@@ -252,6 +261,10 @@ fn envTraceFlag() bool {
 
 const MaxSubscribers: usize = 16;
 
+/// 门面级 1s 合并去抖窗口（design.md §6 验收）：两次派发间隔 <1s 则本次合并不派发
+/// （见文件头「门面级 1s 合并去抖」）。对齐 monoNanos 的 i64 纳秒刻度。
+const MergeWindowNs: i64 = std.time.ns_per_s;
+
 const Subscriber = struct {
     cb: Callback,
     ctx: ?*anyopaque,
@@ -261,6 +274,7 @@ pub const Monitor = struct {
     allocator: std.mem.Allocator,
     hosts: hosts_monitor.HostsMonitor,
     proxy: proxy_monitor.ProxyMonitor,
+    dns: dns_monitor.DnsMonitor,
 
     /// 共享锁：保护 subscriber 注册表 + started/subscribed 标志 + diff 基线。
     mutex: zf.sync.Mutex = .{},
@@ -268,6 +282,10 @@ pub const Monitor = struct {
     subscribed: bool = false,
     prev_valid: bool = false,
     prev_facts: Facts = .{},
+
+    /// 上次粗派发时刻（monoNanos，纳秒）。0 = 从未派发（首次必派发）；
+    /// dispatch() 内做 1s 合并去抖门控（见文件头）。
+    last_dispatch_ns: i64 = 0,
 
     subs: [MaxSubscribers]Subscriber = undefined,
     sub_count: usize = 0,
@@ -289,10 +307,13 @@ pub const Monitor = struct {
         const proxy = try proxy_monitor.ProxyMonitor.init(allocator);
         errdefer proxy.deinit();
 
-        return .{ .allocator = allocator, .hosts = hosts, .proxy = proxy };
+        const dns = try dns_monitor.DnsMonitor.init(allocator);
+        errdefer dns.deinit();
+
+        return .{ .allocator = allocator, .hosts = hosts, .proxy = proxy, .dns = dns };
     }
 
-    /// 启动三个子监测 + 订阅内部处理器（幂等；close 后可 restart）。
+    /// 启动四个子监测 + 订阅内部处理器（幂等；close 后可 restart）。
     /// 内部处理器只订阅一次（close 保留各子监测注册表），restart 不重复订阅。
     pub fn start(self: *Monitor) !void {
         self.mutex.lock();
@@ -313,6 +334,7 @@ pub const Monitor = struct {
             try network.subscribe(onNetworkChange, self); // 首个可能 alloc 失败（无前置订阅）
             try self.hosts.subscribe(onHostsChange, self);
             try self.proxy.subscribe(onProxyChange, self);
+            try self.dns.subscribe(onDnsChange, self);
             self.mutex.lock();
             self.subscribed = true;
             self.mutex.unlock();
@@ -322,6 +344,8 @@ pub const Monitor = struct {
         errdefer self.hosts.close();
         try self.proxy.start();
         errdefer self.proxy.close();
+        try self.dns.start();
+        errdefer self.dns.close();
         try network.start(); // 幂等；若 network 早已被启动则无首事件
 
         // 播种基线：network 若已由其他路径运行、未产生首事件，则用当前快照建立基线，
@@ -355,6 +379,15 @@ pub const Monitor = struct {
         return self.currentSnapshot();
     }
 
+    /// 注入平台网络参数（移动端 iOS NE / Android 桥 + 测试注入入口，design.md §5）。
+    /// 更新 network 单例快照后，显式走一次与真实事件相同的 diff/dispatch 路径，
+    /// 使注入能通知订阅者（network.injectPlatformInfo 只 rebuildLocked 不通知）。
+    pub fn injectPlatformInfo(self: *Monitor, info: network.PlatformInjectedInfo) void {
+        network.injectPlatformInfo(info);
+        const ni = network.snapshot();
+        self.handleNetwork(&ni);
+    }
+
     /// 停止三个子监测（幂等，保留订阅，可 restart）。重置 diff 基线。
     pub fn close(self: *Monitor) void {
         self.mutex.lock();
@@ -364,11 +397,13 @@ pub const Monitor = struct {
         }
         self.started = false;
         self.prev_valid = false; // restart 后重新播种基线，避免陈旧 diff
+        self.last_dispatch_ns = 0; // restart 后首次事件应能派发（去抖门控清零）
         self.mutex.unlock();
 
         // 锁外停子监测：join 可能在子监测 emit 回调内等 self.mutex，持锁 join 会死锁。
         self.hosts.close();
         self.proxy.close();
+        self.dns.close();
         network.close();
         std.log.debug("[monitor] stopped", .{});
     }
@@ -378,6 +413,7 @@ pub const Monitor = struct {
         self.close();
         self.hosts.deinit();
         self.proxy.deinit();
+        self.dns.deinit();
         network.deinit();
         std.log.debug("[monitor] deinit", .{});
     }
@@ -415,7 +451,7 @@ pub const Monitor = struct {
 
         if (!d.any()) return; // 相同事件去重
         const snap = self.assembleFrom(info);
-        self.dispatchNetworkDiff(d, &snap);
+        self.dispatch(&snap); // 粗信号：network diff 任一字段非空 → 恰好一次派发
     }
 
     fn handleHosts(self: *Monitor, mtime: i128) void {
@@ -423,7 +459,7 @@ pub const Monitor = struct {
         const snap = self.currentSnapshot();
         var s = snap;
         s.hosts_mtime = mtime; // 事件时间戳（保证与回调一致）
-        self.dispatch(.hosts, &s);
+        self.dispatch(&s); // hosts 变化 → 一次粗回调
     }
 
     fn handleProxy(self: *Monitor, settings: *const proxy_monitor.ProxySettings) void {
@@ -435,27 +471,51 @@ pub const Monitor = struct {
             }
         }
         const snap = self.currentSnapshot();
-        self.dispatch(.proxy, &snap);
+        self.dispatch(&snap); // proxy 变化 → 一次粗回调
+    }
+
+    /// dns_monitor 回调：系统 DNS 在路由/网卡未变时被单独修改（第 4 子监测）。
+    /// 构造快照并**覆盖 dns_servers 为 dns_monitor 的新鲜值**（同 handleHosts 覆盖
+    /// hosts_mtime 模式）——dns_monitor 独立观测，可能迟于 network 快照的 DNS 值。
+    /// 与「接口+DNS 同时变」的 network 触发合并收敛为一次粗回调（门面 1s 去抖）。
+    fn handleDns(self: *Monitor, settings: *const dns_monitor.DnsSettings) void {
+        if (traceEnabled()) {
+            std.log.info("[monitor] source=dns servers={d}", .{settings.servers.len});
+        }
+        var snap = self.currentSnapshot();
+        snap.dns_servers = settings.servers; // 覆盖新鲜值（快照借用 settings 内部缓冲，回调期有效）
+        self.dispatch(&snap); // DNS 独立变化 → 一次粗回调（受 1s 合并去抖门控）
     }
 
     // ---- 派发 ----
 
-    fn dispatchNetworkDiff(self: *Monitor, d: Diff, snap: *const Snapshot) void {
-        if (d.default_route) self.dispatch(.default_route, snap);
-        if (d.route) self.dispatch(.route, snap);
-        if (d.dns) self.dispatch(.dns, snap);
-        if (d.interface) self.dispatch(.interface, snap);
-    }
+    /// 派发「网络变了」粗信号：任一类底层变化恰好派发一次（design.md §5/§6）。
+    ///
+    /// 带**门面级 1s 合并去抖**：距上次派发 <1s 则本次合并不派发（快照仍保持最新，
+    /// 供下次派发 / 主动 snapshot() 承载）。首派发（last_dispatch_ns == 0）必发。
+    /// 目的：同一逻辑变化被多个事件源各报一次（network + dns_monitor / hosts / proxy）
+    /// 时收敛为恰好一次粗回调，消费方不会在亚秒内被同一变化连轰多次。
+    fn dispatch(self: *Monitor, snap: *const Snapshot) void {
+        const now = zf.platform.monoNanos();
 
-    fn dispatch(self: *Monitor, kind: ChangeKind, snap: *const Snapshot) void {
         self.mutex.lock();
+        const last = self.last_dispatch_ns;
+        if (last != 0 and (now - last) < MergeWindowNs) {
+            // 合并：距上次派发 <1s，本次不派发（同一/相邻逻辑变化被多源重复上报）。
+            self.mutex.unlock();
+            if (traceEnabled()) {
+                std.log.info("[monitor] dispatch merged (<1s since last, snapshot stays fresh)", .{});
+            }
+            return;
+        }
+        self.last_dispatch_ns = now;
         const n = self.sub_count;
         if (n > 0) @memcpy(self.emit_scratch[0..n], self.subs[0..n]);
         self.mutex.unlock();
         if (traceEnabled()) {
-            std.log.info("[monitor] dispatch kind={s} subscribers={d}", .{ @tagName(kind), n });
+            std.log.info("[monitor] dispatch network-changed subscribers={d}", .{n});
         }
-        for (self.emit_scratch[0..n]) |sub| sub.cb(kind, snap, sub.ctx);
+        for (self.emit_scratch[0..n]) |sub| sub.cb(snap, sub.ctx);
     }
 
     /// 从某 network 快照装配当前归一化快照（proxy/hosts 读子监测最新值）。
@@ -496,6 +556,11 @@ fn onProxyChange(settings: *const proxy_monitor.ProxySettings, ctx: ?*anyopaque)
     m.handleProxy(settings);
 }
 
+fn onDnsChange(settings: *const dns_monitor.DnsSettings, ctx: ?*anyopaque) void {
+    const m: *Monitor = @ptrCast(@alignCast(ctx orelse return));
+    m.handleDns(settings);
+}
+
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -509,36 +574,41 @@ fn makeIfc(index: u32, name: []const u8, mtu: u32) network.Interface {
     return i;
 }
 
-/// 测试收集器：记录各类语义事件计数 + 最近快照默认接口 index。
+const MaxCollectDns: usize = 4;
+
+/// 测试收集器（v2 粗信号语义）：总回调次数 + 最近一次快照关键字段。
+/// 快照仅回调期有效（借用），故 record 在回调内同步拷贝字段。
 const Collector = struct {
     mutex: zf.sync.Mutex = .{},
-    route: usize = 0,
-    interface_: usize = 0,
-    dns: usize = 0,
-    default_route: usize = 0,
-    proxy: usize = 0,
-    hosts: usize = 0,
-    last_index: ?u32 = null,
+    total: usize = 0,
+    last_gateway: ?zf.net.IpAddr = null,
+    last_dns: [MaxCollectDns]zf.net.IpAddr = undefined,
+    last_dns_len: usize = 0,
+    last_iface_index: ?u32 = null,
+    last_iface_addr_count: usize = 0,
 
-    fn allZero(self: *Collector) bool {
-        return self.route == 0 and self.interface_ == 0 and self.dns == 0 and
-            self.default_route == 0 and self.proxy == 0 and self.hosts == 0;
+    fn record(self: *Collector, snap: *const Snapshot) void {
+        self.total += 1;
+        self.last_gateway = snap.gateway;
+        self.last_iface_index = if (snap.default_interface) |i| i.index else null;
+        self.last_iface_addr_count = if (snap.default_interface) |i| i.addresses.len else 0;
+        self.last_dns_len = @min(snap.dns_servers.len, MaxCollectDns);
+        @memcpy(self.last_dns[0..self.last_dns_len], snap.dns_servers[0..self.last_dns_len]);
     }
 };
 
-fn collectCb(kind: ChangeKind, snap: *const Snapshot, ctx: ?*anyopaque) void {
+fn collectCb(snap: *const Snapshot, ctx: ?*anyopaque) void {
     const c: *Collector = @ptrCast(@alignCast(ctx.?));
     c.mutex.lock();
     defer c.mutex.unlock();
-    switch (kind) {
-        .route => c.route += 1,
-        .interface => c.interface_ += 1,
-        .dns => c.dns += 1,
-        .default_route => c.default_route += 1,
-        .proxy => c.proxy += 1,
-        .hosts => c.hosts += 1,
-    }
-    c.last_index = if (snap.default_interface) |i| i.index else null;
+    c.record(snap);
+}
+
+/// 锁内读总回调次数（单值便捷断言）。
+fn colTotal(c: *Collector) usize {
+    c.mutex.lock();
+    defer c.mutex.unlock();
+    return c.total;
 }
 
 test "mod: Snapshot 默认值" {
@@ -666,7 +736,7 @@ test "mod: Monitor 生命周期（start/close 幂等 + close 后重启）" {
     // defer mon.deinit() 重置 network 全局
 }
 
-test "mod: 门面把 network diff 分发为统一语义事件（确定性，无真实事件源）" {
+test "mod: 验收准则 — 任一类 network diff 恰好一次粗回调（多字段同变收敛）" {
     // 直接经 handleNetwork 注入 NetworkInfo，绕开真实事件源（幂等确定性）。
     network.deinit();
 
@@ -679,65 +749,180 @@ test "mod: 门面把 network diff 分发为统一语义事件（确定性，无�
     const gw1 = zf.net.IpAddr{ .v4 = .{ 192, 168, 1, 1 } };
     const gw2 = zf.net.IpAddr{ .v4 = .{ 192, 168, 1, 254 } };
     const dns_a = [_]zf.net.IpAddr{.{ .v4 = .{ 1, 1, 1, 1 } }};
-    const dns_b = [_]zf.net.IpAddr{.{ .v4 = .{ 8, 8, 8, 8 } }};
+    const dns_b = [_]zf.net.IpAddr{ .{ .v4 = .{ 8, 8, 8, 8 } }, .{ .v4 = .{ 8, 8, 4, 4 } } };
     const ifc_1500 = makeIfc(1, "en0", 1500);
-    const ifc_9000 = makeIfc(1, "en0", 9000);
     const ifc_en1 = makeIfc(2, "en1", 9000);
 
     const base = network.NetworkInfo{ .default_interface = ifc_1500, .gateway = gw1, .dns_servers = &dns_a };
 
     // 首个事件 → 仅建立基线，不派发。
     mon.handleNetwork(&base);
-    col.mutex.lock();
-    try testing.expect(col.allZero());
-    col.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), colTotal(&col));
 
     // 相同事件重复到达 → diff 空 → 不派发（去重）。
     mon.handleNetwork(&base);
-    col.mutex.lock();
-    try testing.expect(col.allZero());
-    col.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), colTotal(&col));
 
-    // 仅 gateway 变 → route。
+    // 单字段变化（仅 DNS 列表变）→ 恰好 1 次粗回调。
     var info = base;
-    info.gateway = gw2;
-    mon.handleNetwork(&info);
-    col.mutex.lock();
-    try testing.expectEqual(@as(usize, 1), col.route);
-    try testing.expectEqual(@as(usize, 0), col.dns);
-    try testing.expectEqual(@as(usize, 0), col.interface_);
-    try testing.expectEqual(@as(usize, 0), col.default_route);
-    col.mutex.unlock();
-
-    // DNS 列表变 → dns。
     info.dns_servers = &dns_b;
     mon.handleNetwork(&info);
-    col.mutex.lock();
-    try testing.expectEqual(@as(usize, 1), col.dns);
-    try testing.expectEqual(@as(usize, 1), col.route);
-    col.mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), colTotal(&col));
 
-    // 同接口 mtu 变 → interface（身份不变）。
-    info.default_interface = ifc_9000;
-    mon.handleNetwork(&info);
-    col.mutex.lock();
-    try testing.expectEqual(@as(usize, 1), col.interface_);
-    try testing.expectEqual(@as(usize, 0), col.default_route);
-    col.mutex.unlock();
-
-    // 接口身份变 → default_route，且快照承载新默认接口 index。
+    // 多字段同变（换网：gateway + 默认接口身份 + DNS 全变）→ 收敛为恰好 1 次，
+    // 快照承载变化后的新状态（新默认接口 index）。
+    mon.last_dispatch_ns = 0; // 本测试直接驱动 handle*，模拟每次真实变化间隔 >1s
+    //（门面 1s 合并去抖由「1s 合并去抖」专门测试覆盖，此处不依赖亚秒内多派发）。
+    info = base;
+    info.gateway = gw2;
     info.default_interface = ifc_en1;
+    // info.dns_servers 回到 dns_a ≠ 上一状态 dns_b → DNS 字段也变。
     mon.handleNetwork(&info);
     col.mutex.lock();
-    try testing.expectEqual(@as(usize, 1), col.default_route);
-    try testing.expectEqual(@as(u32, 2), col.last_index.?);
-    try testing.expectEqual(@as(usize, 0), col.proxy); // 无 proxy/hosts 事件
-    try testing.expectEqual(@as(usize, 0), col.hosts);
+    try testing.expectEqual(@as(usize, 2), col.total);
+    try testing.expectEqual(@as(u32, 2), col.last_iface_index.?);
+    col.mutex.unlock();
+
+    // 同接口属性变化（en1 mtu 9000→1500，身份不变）→ 恰好 1 次粗回调。
+    mon.last_dispatch_ns = 0; // 同上：越过 1s 门控，本真实变化应派发
+    const ifc_en1_mtu1500 = makeIfc(2, "en1", 1500);
+    const attr = network.NetworkInfo{ .default_interface = ifc_en1_mtu1500, .gateway = gw2, .dns_servers = &dns_a };
+    mon.handleNetwork(&attr);
+    col.mutex.lock();
+    try testing.expectEqual(@as(usize, 3), col.total);
+    try testing.expectEqual(@as(u32, 2), col.last_iface_index.?);
+    col.mutex.unlock();
+}
+
+test "mod: injectPlatformInfo — 注入走真实事件同路径，恰好一次粗回调 + 快照反映注入值" {
+    network.deinit();
+
+    var mon = try Monitor.init(testing.allocator, .{ .hosts_path = "" });
+    defer mon.deinit();
+
+    var col = Collector{};
+    try mon.subscribe(collectCb, &col);
+    try mon.start(); // 建立基线（真实默认接口 + DNS），不派发
+
+    try testing.expectEqual(@as(usize, 0), colTotal(&col)); // 基线期无粗回调
+
+    // network.injectPlatformInfo 的 rebuildLocked 需默认接口存在才承载注入值
+    // （无默认路由时注入被丢弃，network.zig 既有行为）；离线主机如实跳过，
+    // 与 darwin 特权真实事件测试的 SkipZigTest 先例一致。
+    if (network.snapshot().default_interface == null) return error.SkipZigTest;
+
+    // 注入一组与真实基线不同的 dns/gateway/addresses（198.18.0.0/15 测试段，
+    // 避开真实局域网值，保证与基线产生 diff）。
+    const dns = [_]zf.net.IpAddr{ .{ .v4 = .{ 9, 9, 9, 9 } }, .{ .v4 = .{ 1, 0, 0, 1 } } };
+    const gw = zf.net.IpAddr{ .v4 = .{ 198, 18, 1, 1 } };
+    const addrs = [_]ntypes.AddressInfo{.{ .addr = .{ .v4 = .{ 198, 18, 0, 5 } }, .prefix_len = 16 }};
+    mon.injectPlatformInfo(.{ .dns_servers = &dns, .gateway = gw, .addresses = &addrs });
+
+    // 恰好一次粗回调，且回调携带的快照反映注入值。
+    col.mutex.lock();
+    try testing.expectEqual(@as(usize, 1), col.total);
+    try testing.expect(ipEqual(col.last_gateway.?, gw));
+    try testing.expectEqual(@as(usize, 2), col.last_dns_len);
+    try testing.expect(ipEqual(col.last_dns[0], dns[0]));
+    try testing.expect(ipEqual(col.last_dns[1], dns[1]));
+    col.mutex.unlock();
+
+    // 主动 snapshot() 同样反映注入值（dns/gateway/addresses 挂默认接口）。
+    const s = mon.snapshot();
+    try testing.expect(s.default_interface != null);
+    try testing.expect(ipEqual(s.gateway.?, gw));
+    try testing.expectEqual(@as(usize, 2), s.dns_servers.len);
+    try testing.expect(ipEqual(s.dns_servers[0], dns[0]));
+    try testing.expect(ipEqual(s.dns_servers[1], dns[1]));
+    try testing.expectEqual(@as(usize, 1), s.default_interface.?.addresses.len);
+    try testing.expect(ipEqual(s.default_interface.?.addresses[0].addr, addrs[0].addr));
+
+    // 重复注入相同值 → diff 空 → 去重，不额外派发。
+    mon.injectPlatformInfo(.{ .dns_servers = &dns, .gateway = gw, .addresses = &addrs });
+    try testing.expectEqual(@as(usize, 1), colTotal(&col));
+}
+
+test "mod: handleDns — DNS 独立变化恰好一次粗回调 + 快照 dns_servers 反映新值" {
+    // 直接经 handleDns 注入 DnsSettings（仿 handleNetwork 直接驱动模式），
+    // 绕开 dns_monitor 平台事件源（幂等确定性）；验证第 4 子监测接入门面。
+    network.deinit();
+
+    var mon = try Monitor.init(testing.allocator, .{ .hosts_path = "" });
+    defer mon.deinit();
+
+    var col = Collector{};
+    try mon.subscribe(collectCb, &col);
+
+    const dns_fresh = [_]zf.net.IpAddr{ .{ .v4 = .{ 1, 1, 1, 1 } }, .{ .v4 = .{ 9, 9, 9, 9 } } };
+    const settings = dns_monitor.DnsSettings{ .servers = &dns_fresh };
+    mon.handleDns(&settings); // 首派发（门控 0）→ 必发
+
+    // 恰好一次粗回调，且回调携带的快照 dns_servers = dns_monitor 新鲜值
+    // （覆盖 network 快照 DNS，同 handleHosts 覆盖 hosts_mtime 模式）。
+    col.mutex.lock();
+    try testing.expectEqual(@as(usize, 1), col.total);
+    try testing.expectEqual(@as(usize, 2), col.last_dns_len);
+    try testing.expect(ipEqual(col.last_dns[0], dns_fresh[0]));
+    try testing.expect(ipEqual(col.last_dns[1], dns_fresh[1]));
+    col.mutex.unlock();
+}
+
+test "mod: 门面 1s 合并去抖 — 连续两次派发 <1s 收敛为恰好一次粗回调" {
+    // 验收场景：「接口+DNS 同时变」被 network 与 dns_monitor 各触发一次时，
+    // 门面合并为恰好一次；handleDns ×2 同理。越过 1s 窗后的真实变化仍派发且
+    // 快照为最新值（合并不清空状态）。测试直接驱动 handle*，<1s 由 monoNanos 判定。
+    network.deinit();
+
+    var mon = try Monitor.init(testing.allocator, .{ .hosts_path = "" });
+    defer mon.deinit();
+
+    var col = Collector{};
+    try mon.subscribe(collectCb, &col);
+
+    const gw1 = zf.net.IpAddr{ .v4 = .{ 192, 168, 1, 1 } };
+    const dns_a = [_]zf.net.IpAddr{.{ .v4 = .{ 1, 1, 1, 1 } }};
+    const dns_b = [_]zf.net.IpAddr{ .{ .v4 = .{ 8, 8, 8, 8 } }, .{ .v4 = .{ 8, 8, 4, 4 } } };
+    const ifc_en0 = makeIfc(1, "en0", 1500);
+    const ifc_en1 = makeIfc(2, "en1", 1500);
+
+    const base = network.NetworkInfo{ .default_interface = ifc_en0, .gateway = gw1, .dns_servers = &dns_a };
+
+    // 首个 network 事件 → 仅建立基线，不派发。
+    mon.handleNetwork(&base);
+    try testing.expectEqual(@as(usize, 0), colTotal(&col));
+
+    // 「接口变」→ network 触发派发 #1（首派发必发）。
+    var iface_changed = base;
+    iface_changed.default_interface = ifc_en1;
+    mon.handleNetwork(&iface_changed);
+    try testing.expectEqual(@as(usize, 1), colTotal(&col));
+
+    // 同一逻辑变化被 dns_monitor 补报（<1s 内）→ 合并，不再派发。
+    mon.handleDns(&dns_monitor.DnsSettings{ .servers = &dns_b });
+    try testing.expectEqual(@as(usize, 1), colTotal(&col));
+
+    // handleDns ×2：越过 1s 窗后首条派发，第二条 <1s → 合并。
+    mon.last_dispatch_ns = 0; // 模拟上次派发已 >1s（真实间隔由 monoNanos 判定）
+    const dns_c = [_]zf.net.IpAddr{ .{ .v4 = .{ 114, 114, 114, 114 } }, .{ .v4 = .{ 1, 0, 0, 1 } } };
+    mon.handleDns(&dns_monitor.DnsSettings{ .servers = &dns_c });
+    try testing.expectEqual(@as(usize, 2), colTotal(&col));
+
+    const dns_d = [_]zf.net.IpAddr{.{ .v4 = .{ 223, 5, 5, 5 } }};
+    mon.handleDns(&dns_monitor.DnsSettings{ .servers = &dns_d }); // <1s 内 → 合并
+    try testing.expectEqual(@as(usize, 2), colTotal(&col));
+
+    // 合并不丢快照：越过 1s 窗后的下一次真实变化仍派发，快照为最新值。
+    mon.last_dispatch_ns = 0;
+    mon.handleDns(&dns_monitor.DnsSettings{ .servers = &dns_d });
+    col.mutex.lock();
+    try testing.expectEqual(@as(usize, 3), col.total);
+    try testing.expectEqual(@as(usize, 1), col.last_dns_len);
+    try testing.expect(ipEqual(col.last_dns[0], dns_d[0]));
     col.mutex.unlock();
 }
 
 // 单测汇总：显式引入使各文件顶层 test 块注册（network/system_proxy 的平台后端
-// 由各自主文件的 comptime @import 自动带入；hosts/proxy 分平台文件同理）。
+// 由各自主文件的 comptime @import 自动带入；hosts/proxy/dns 分平台文件同理）。
 test {
     _ = @import("types.zig");
     _ = @import("network.zig");
@@ -747,4 +932,5 @@ test {
     _ = @import("system_proxy_common.zig");
     _ = @import("hosts_monitor.zig");
     _ = @import("proxy_monitor.zig");
+    _ = @import("dns_monitor.zig");
 }

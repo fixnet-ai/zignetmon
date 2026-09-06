@@ -1,164 +1,137 @@
-# Design: zignetmon — 网络变化监测与自适应库
+# Design v2: zignetmon — 网络变化监测与自适应库
 
-> 本文是 zignetmon 的架构权威文档。目标、背景、研究定论见 `findings.md`；阶段进度见 `task_plan.md`。
+> 目标、背景、研究定论见 `findings.md`；阶段进度见 `task_plan.md`。
+> **v2 重设计（2026-09-07）**：据业务真实需求收敛 API——消费方只需「网络变了」一个粗信号，五类事件是**监测覆盖度**（内部），不是消费方契约。
 
-## 1. 核心结论：不是从零设计，是「提取 + 扩展」
+## 1. 核心结论
 
-「网络变化监测」已在 zigfoundation 作为 `zf.network`（#43）+ `zf.system_proxy`（#79）实现并历经真机/VM/winx64 验证。zignetmon 的职责：
+1. **不是从零设计**：`zf.network`（#43）+ `zf.system_proxy`（#79）已实现网络变化监测并历经验证；zignetmon = 提取 + 扩展。
+2. **v2 简化**：外部 API 收敛为「网络变了」粗信号 + 当前状态快照；六值 `ChangeKind` 降级为内部诊断（trace 日志）。
+3. **平台感知**：移动端 ≠ PC。hosts 文件 / 系统代理是桌面专属；移动端只有「路径/网络变化」粗信号 + 注入。
+4. **可测试性优先**：三层测试架构（单元注入 / VM 真事件 / 移动注入），先自身质量、后切接。
 
-1. **提取**：把 `zf.network`（路由/网卡/DNS 监测）+ `zf.system_proxy`（系统代理副作用）从 zf 抽出，适配 import 后独立构建、单测绿。
-2. **扩展**：补齐五类事件中缺失的「hosts 文件」「系统代理变化」监测 + 统一的 5 类语义事件门面。
-3. **成为唯一实现源**：后续 zf.network/system_proxy 从 zf 移除，消费方改 `@import("zignetmon")`（**切接是后续独立阶段，不在本项目内做**）。
+依赖方向：`zignetmon → zigfoundation`（`zf.net/platform/sync/socket/egress/endian/win_dll/log`）。无反向。
 
-依赖方向：`zignetmon → zigfoundation`（用 `zf.net.IpAddr`/`zf.platform`/`zf.sync.Mutex`/`zf.socket`/`zf.egress`/`zf.endian`/`zf.win_dll`/`zf.log`）。无反向依赖。
+## 2. 提取面（P1，已完成）
 
-## 2. 提取面（P1）
+12 文件（`network*` + `system_proxy*`）从 zf 提取，import 适配规则见 git log `b8552d0`。此段不变。
 
-### 2.1 文件清单（12 文件，zf/src → zignetmon/src）
+## 3. 平台能力矩阵（移动 ≠ PC）
 
-| 源（zf/src/） | 目标（zignetmon/src/） | 角色 |
-|---|---|---|
-| network.zig | network.zig | 网络门面（单例 + 回调 + 快照） |
-| network_types.zig | network_types.zig | 共享类型（IpAddr/AddressInfo/NetworkInterface/回调） |
-| network_params.zig | network_params.zig | 参数查询（网关/地址/DNS/链路） |
-| network_darwin.zig | network_darwin.zig | macOS/iOS AF_ROUTE 后端 |
-| network_linux.zig | network_linux.zig | Linux/Android netlink 后端 |
-| network_windows.zig | network_windows.zig | Windows iphlpapi 后端 |
-| system_proxy.zig | system_proxy.zig | 系统代理 set/restore 门面 |
-| system_proxy_common.zig | system_proxy_common.zig | 共享纯函数 |
-| system_proxy_darwin.zig | system_proxy_darwin.zig | macOS 后端 |
-| system_proxy_linux.zig | system_proxy_linux.zig | Linux 后端 |
-| system_proxy_windows.zig | system_proxy_windows.zig | Windows 后端 |
-| system_proxy_stub.zig | system_proxy_stub.zig | 移动/未支持 stub |
-
-### 2.2 import 适配规则（机械替换，全 12 文件）
-
-| 原 import（zf 内兄弟文件） | 替换为 |
-|---|---|
-| `@import("mod.zig")` | `@import("zigfoundation")` |
-| `@import("net.zig")` | `@import("zigfoundation").net` |
-| `@import("egress.zig")` | `@import("zigfoundation").egress` |
-| `@import("endian.zig")` | `@import("zigfoundation").endian` |
-| `@import("sync.zig")` | `@import("zigfoundation").sync` |
-| `@import("socket.zig")` | `@import("zigfoundation").socket` |
-| `@import("platform.zig")` | `@import("zigfoundation").platform` |
-| `@import("win_dll.zig")` | `@import("zigfoundation").win_dll` |
-
-兄弟文件 import **不改**（`@import("network_types.zig")`、`@import("network_params.zig")`、`@import("network_windows.zig")`、`@import("system_proxy_common.zig")`、`@import("system_proxy_*.zig")` 保持局部）。
-
-变量名保持不变（`foundation`/`zf` 变量名只需指向 zigfoundation，无需改名）。若某文件还有未列出的 zf 兄弟 import（如 `log.zig`），同样映射到 `zigfoundation.*`。
-
-### 2.3 适配后验收
-
-- `zig build test` 全绿（含 network/system_proxy 的全部移植单测）。
-- 组件日志前缀规范：zf 门面内已用 `[network]`，zignetmon 侧保留；**禁止**改日志前缀为 zignetmon 专名（避免消费方 grep 失效），如需新增用 `[hosts]`/`[proxy]`/`[monitor]`。
-
-## 3. 五类事件 × 五平台覆盖矩阵（目标态）
-
-| 事件类别 | macOS | Windows | Linux | iOS | Android |
+| 能力 | macOS | Windows | Linux | iOS | Android |
 |---|---|---|---|---|---|
-| 路由 route | AF_ROUTE ✅(提取) | NotifyRouteChange2 ✅ | netlink ✅ | AF_ROUTE ✅ | netlink ✅ |
-| 网卡 interface | SCDynamicStore/AF_ROUTE ✅ | NotifyIpInterfaceChange ✅ | netlink ✅ | NWPath 桥 ✅ | NetworkCallback ✅ |
-| DNS dns | 门面 diff ✅ | 门面 diff ✅ | resolv.conf ✅(提取) | 注入 ✅ | LinkProperties ✅ |
-| 系统代理 proxy | SCDynamicStore(Global/Proxies) 🆕 | 注册表 notify 🆕 | dconf inotify 🆕(尽力) | stub | stub |
-| hosts 文件 | stat diff 轮询 🆕 | stat diff 轮询 🆕 | stat diff 轮询 🆕 | no-op | no-op |
+| 路由/网卡事件源 | AF_ROUTE + SCDynamicStore | NotifyRouteChange2 + IpInterface | netlink | NWPathMonitor / 注入 | netlink / NetworkCallback |
+| DNS | SCDynamicStore / resolv.conf | 注册表 / GAA | resolv.conf | 注入 | LinkProperties / 注入 |
+| 系统代理监测 | SCDynamicStore(Global/Proxies) | 注册表 notify | dconf inotify | ❌ 无 | ❌ 无（app 级） |
+| hosts 文件 | ✅ stat diff | ✅ stat diff | ✅ stat diff | ❌ 无 hosts | ❌ 无 hosts |
+| 默认接口判定 | sysctl | GetIPForwardTable2 | /proc/net/route | socket 回退 | /proc/net/route |
 
-> ✅ = 提取自 zf 已有；🆕 = 本阶段扩展新增；「门面 diff」= 无需独立 OS 事件源，门面层比对快照变化即产出 dns 事件（DNS 变化几乎总伴随网卡变化）。
+> **DNS 行标注（本补丁）**：系统 DNS 的**独立变化**（路由/网卡未变时单独被改）已由新增 `dns_monitor`
+> **独立事件源（本补丁）已覆盖**——macOS `SCDynamicStore`「State:/Network/Global/DNS」/ Windows 注册表
+> `Tcpip\Parameters\Interfaces` RegNotify / Linux inotify `/etc/resolv.conf`（+ mtime 兜底）；iOS 无
+> （SCDynamicStore 沙箱不可用，darwin 内恒 no-op）、Android 归 stub，均由注入承载。此前 DNS 仅靠门面
+> 对 network 快照 diff 的附带监测、无独立事件源，本补丁补上。
 
-## 4. 三层架构（最终）
+**关键**：hosts / 系统代理是**桌面专属能力**；移动端无 hosts 文件、无桌面系统代理语义，只有「网络路径/网络变化」粗信号，且 iOS NE / Android 受限环境由上层**注入**网络参数（`injectPlatformInfo`）。当前实现已正确处理（`defaultHostsPath()==""` 移动 no-op、`proxy_monitor_stub` 移动 no-op），本文把它显式化为**平台能力矩阵**，不再用「5×5 全平台」误导。
+
+## 4. 三层架构（不变）
 
 ```
-① 事件源层（平台后端）  network_*.zig / hosts_monitor / proxy_monitor_*.zig
-        ↓ 裸事件
-② 归一化层（门面）     mod.zig：快照比对 → diff → 去抖 → 5 类语义事件
-        ↓ ChangeKind + Snapshot
-③ 决策层（消费方）     zigbox 等：收到事件 → 重测环境 → Session 重建
+① 事件源层（平台后端）  network_*.zig / hosts_monitor / proxy_monitor_*.zig / dns_monitor*.zig
+        ↓ 裸事件（各自回调）
+② 归一化层（门面）     mod.zig：订阅四子监测（network / hosts / proxy / dns）→ 快照比对 → 去抖去重 → 一个粗信号
+        ↓ 回调(snapshot)
+③ 决策层（消费方）     zigbox 等：收到「网络变了」→ 重读快照 → 重置自身状态
 ```
 
-## 5. API 契约（供实现，固定签名）
-
-### 5.1 类型 `types.zig`
+## 5. API 契约 v2（消费方面向，极简）
 
 ```zig
-pub const ChangeKind = enum { route, interface, dns, proxy, hosts, default_route };
-```
+// ===== 外部契约（zigbox 等消费方只用这些）=====
 
-### 5.2 hosts 监测 `hosts_monitor.zig`（跨平台，单文件）
+/// 网络变化回调：收到即「网络环境已变」，消费方应重置自身依赖网络的状态。
+/// snap 为变化后的当前状态快照（借用，仅在下一次变化前有效）。
+pub const Callback = *const fn (snap: *const Snapshot, ctx: ?*anyopaque) void;
 
-```zig
-pub const Callback = *const fn (mtime: i128, ctx: ?*anyopaque) void;
-pub fn defaultHostsPath() []const u8; // comptime：POSIX /etc/hosts；Win C:\Windows\System32\drivers\etc\hosts
-pub const HostsMonitor = struct {
-    pub fn init(allocator: std.mem.Allocator, path: []const u8) !HostsMonitor; // dupe path
-    pub fn start(self: *HostsMonitor) !void;   // 后台线程 5s stat diff（幂等）
-    pub fn subscribe(self: *HostsMonitor, cb: Callback, ctx: ?*anyopaque) !void;
-    pub fn lastMtime(self: *HostsMonitor) ?i128;
-    pub fn close(self: *HostsMonitor) void;    // 停线程（幂等）
-    pub fn deinit(self: *HostsMonitor) void;   // 释放
-};
-```
-
-实现要点：后台线程 `sleepNs(5s)` 后 `std.Io.Dir.statFile` 比 mtime+size，变了才 emit；非忙等（5s 间隔）。iOS/Android `defaultHostsPath` 返回空 → start 立即 no-op。
-
-### 5.3 系统代理变化监测 `proxy_monitor.zig`（分平台）
-
-```zig
-pub const ProxySettings = struct { enabled: bool = false, host: ?[]const u8 = null, port: u16 = 0 };
-pub const Callback = *const fn (settings: *const ProxySettings, ctx: ?*anyopaque) void;
-pub const ProxyMonitor = struct {
-    pub fn init(allocator: std.mem.Allocator) !ProxyMonitor;
-    pub fn start(self: *ProxyMonitor) !void;
-    pub fn subscribe(self: *ProxyMonitor, cb: Callback, ctx: ?*anyopaque) !void;
-    pub fn snapshot(self: *ProxyMonitor) ?ProxySettings;
-    pub fn close(self: *ProxyMonitor) void;
-    pub fn deinit(self: *ProxyMonitor) void;
-};
-```
-
-分平台（comptime 分派）：`proxy_monitor_darwin.zig`（SCDynamicStore Global/Proxies）/ `proxy_monitor_windows.zig`（RegNotifyChangeKeyValue Internet Settings）/ `proxy_monitor_linux.zig`（inotify ~/.config/dconf/user，尽力）/ `proxy_monitor_stub.zig`（移动）。macOS 实现为完整 + 真事件；Win/Linux 为源码 + 待 VM 验证；stub 恒 no-op。
-
-### 5.4 统一门面 `mod.zig`
-
-```zig
-pub const ChangeKind = types.ChangeKind;
+/// 当前网络状态快照（消费方重置自身状态的依据）。借用语义见文件头。
 pub const Snapshot = struct {
-    default_interface: ?network.Interface = null,
-    gateway: ?zf.net.IpAddr = null,
-    dns_servers: []const zf.net.IpAddr = &.{},
-    proxy: ?proxy_monitor.ProxySettings = null,
-    hosts_mtime: ?i128 = null,
+    default_interface: ?network.Interface = null,   // 默认出口接口
+    gateway: ?zf.net.IpAddr = null,                 // 默认网关
+    dns_servers: []const zf.net.IpAddr = &.{},       // 系统 DNS
+    proxy: ?proxy_monitor.ProxySettings = null,     // 系统代理（桌面才有）
+    hosts_mtime: ?i128 = null,                       // hosts mtime（桌面才有）
 };
-pub const Callback = *const fn (kind: ChangeKind, snap: *const Snapshot, ctx: ?*anyopaque) void;
-pub const Opt = struct { hosts_path: ?[]const u8 = null, excluded_interfaces: []const network.ExcludedInterface = &.{}, under_network_extension: bool = false };
+
+pub const Opt = struct {
+    hosts_path: ?[]const u8 = null,
+    excluded_interfaces: []const network.ExcludedInterface = &.{},
+    under_network_extension: bool = false,
+};
+
 pub const Monitor = struct {
     pub fn init(allocator: std.mem.Allocator, opts: Opt) !Monitor;
-    pub fn start(self: *Monitor) !void;
+    pub fn start(self: *Monitor) !void;                       // 启动全部事件源（幂等）
     pub fn subscribe(self: *Monitor, cb: Callback, ctx: ?*anyopaque) !void;
-    pub fn snapshot(self: *Monitor) Snapshot;
-    pub fn close(self: *Monitor) void;
-    pub fn deinit(self: *Monitor) void;
+    pub fn snapshot(self: *Monitor) Snapshot;                 // 主动查询当前状态
+    pub fn injectPlatformInfo(self: *Monitor, info: network.PlatformInjectedInfo) void; // 移动/测试注入
+    pub fn close(self: *Monitor) void;                        // 停事件源（幂等，可 restart）
+    pub fn deinit(self: *Monitor) void;                       // 释放 + 重置 network 单例
 };
+
 // 子模块保留导出（高级用法）
-pub const network = @import("network.zig");
-pub const system_proxy = @import("system_proxy.zig");
+pub const network = @import("network.zig");           // 网络门面（路由/网卡/DNS）
+pub const system_proxy = @import("system_proxy.zig"); // 系统代理 set/restore 原语
+pub const hosts_monitor = @import("hosts_monitor.zig");
+pub const proxy_monitor = @import("proxy_monitor.zig");
+pub const dns_monitor = @import("dns_monitor.zig"); // 系统 DNS 独立变化监测（第 4 子监测，本补丁）
 ```
 
-门面 diff 逻辑（纯函数，可单测）：缓存上次快照，收到 network 回调时比对 → gateway 变 = `route`；默认接口变 = `default_route`；dns 列表变 = `dns`；接口集合变 = `interface`。hosts/proxy 子监测回调 → 对应 `ChangeKind`。emit 统一回调。
+**关键变化（相对 v1）**：
+1. **移除 `ChangeKind` 出公开契约**——回调不再携带 `kind`，五类变化都收敛为一个「网络变了」信号。消费方不区分「路由变了还是 DNS 变了」，一律重置。
+2. **新增 `injectPlatformInfo`**——既是移动端（iOS NE / Android 桥）的生产入口，也是**测试注入入口**（Tier 1/3 的核心）。
+3. **快照仍携带全量状态**——消费方收到信号后直接读 snap 重设自身变量，无需二次 `snapshot()` 调用。
 
-### 5.5 可观测 `ZF_NETWORK_TRACE`
+`ChangeKind` 保留在 `types.zig` 作**内部诊断**（`ZF_NETWORK_TRACE=1` 时日志标出「哪类字段变了」），不进消费方回调签名。
 
-`ZF_NETWORK_TRACE=1` 环境变量开启 info 级全流程日志：事件源收到 → 归一化 diff → 去抖 → 事件分发，经 `zf.log`（`std.log.info("[monitor] ...")`）。默认关闭。实现为门面内一个 `traceEnabled()` 判定（读取 env 一次缓存）。
+## 6. 测试架构 v2（三层，业务需求驱动）
 
-## 6. 测试方法（P4）
+**验收准则（业务需求）**：任一类网络设置变化（路由/网卡/DNS/代理/hosts）→ 消费方**恰好收到一次**「网络变了」回调，且快照承载变化后的新状态。
 
-- **单元测试**：`zig build test` 覆盖 — 门面 diff 纯函数（5 类判定）、hosts 快照、proxy 快照、network/system_proxy 移植单测全绿。
-- **真实事件**（macOS，本机可跑）：`sudo route` 加删 TEST-NET 路由 → AF_ROUTE 事件（network_darwin 已有真事件测试先例）。
-- **zigtester.yaml**：`unit` 层 `all-tests`（`zig build test`）；functional 真实事件源测试挂 `macvm`（TUN 类先例）。
-- **被测机脚本自愈**：`tests/scripts/` 下 nohup 脚本，ssh 断开仍继续（用户裁定）。
+### Tier 1 — 单元/注入测试（host 本机，确定性，无 OS 事件）
 
-## 7. 关键决策（已定）
+- **注入**：`Monitor.injectPlatformInfo(...)` 走与真实事件完全相同的 diff/dispatch 路径，确定性触发。
+- **覆盖**：diff 判定（哪类字段变了→是否触发）、基线语义（首个事件建基线不派发）、去重（相同事件不派发）、去抖、快照借用、生命周期（start/close 幂等 + 重启）。
+- **Tier1 dns_monitor 独立变化注入单测（本补丁）**：构造系统 DNS 服务器列表**独立**变化（路由/网卡不变）→ `dns_monitor` 子监测触发、门面 `handleDns` 恰好一次粗回调 + 快照 `dns_servers` 覆盖为新鲜值；含 darwin 启停幂等 / 逐地址去重（ipEqual）/ 真读系统 DNS 快照单测（host 全绿）。
+- 平台无关，`zig build test` 全绿（61/61，含注入路径 + dns_monitor 本补丁）。
 
-1. **API 形态**：统一 `Monitor` 门面 = 订阅回调（`ChangeKind` + `Snapshot`）+ 主动 `snapshot()`。五类统一单回调，按 `ChangeKind` 区分。
-2. **分层边界**：归一化层（门面）做 diff + 去抖 + 语义分类；默认接口判定留在 `network`（平台分文件）；hosts/proxy 独立子监测。
-3. **平台后端组织**：每平台一文件（`network_*.zig`/`proxy_monitor_*.zig`），comptime `builtin.os.tag` 分派；hosts 跨平台单文件。
-4. **可观测**：`ZF_NETWORK_TRACE` 开关 + `zf.log` info 级 + `[monitor]`/`[hosts]`/`[proxy]` 前缀。
+### Tier 2 — 真实事件源（3 VM，触发真实 OS 事件）
+
+| VM | 触发手段 | 驱动的事件源 |
+|---|---|---|
+| macvm | `sudo route add/delete`（TEST-NET）· `networksetup -setdnsservers` · `networksetup -setwebproxy` | AF_ROUTE / SCDynamicStore / SCDynamicStore(Proxies) |
+| linuxvm | `ip route add/del` · 改 `/etc/resolv.conf` · 改 `/etc/hosts` | netlink / resolv.conf / inotify |
+| windowsvm | `netsh interface ipv4 add/delete route` · 注册表 Internet Settings · 改 hosts | NotifyRouteChange2 / RegNotify / ReadDirectoryChangesW |
+
+- **断言**：订阅回调在超时窗口内触发 ≥1 次，且快照反映新状态。
+- 脚本放 `tests/scripts/`，nohup 自愈（ssh 断开仍继续，用户裁定）；经 `vm-regression.sh` 白名单套件接入。
+- **hosts 真实事件**在桌面三 VM 覆盖；移动端 hosts 不在矩阵内（无此能力）。
+
+### Tier 3 — 移动端（iOS/Android，注入为主，真实设备远期）
+
+- **iOS**：模拟 NE 桥注入 `injectPlatformInfo`（NWPathMonitor 等价信息）→ monitor 触发。
+- **Android**：模拟 JNI 桥注入（ConnectivityManager/LinkProperties 等价信息）→ monitor 触发。
+- **无真机需求**（单元层覆盖）；真实设备 E2E 是集成级，后续再说。
+- **能力边界断言**：移动端 `defaultHostsPath()==""`、`proxy_monitor` 归 stub、hosts/proxy 不产生事件——单测锁定「移动无 hosts/proxy」语义。
+
+## 7. 关键决策（v2 已定）
+
+1. **API 形态**：`Monitor` 门面 = 订阅「网络变了」粗回调（带快照）+ 主动 `snapshot()` + `injectPlatformInfo`。
+2. **ChangeKind**：内部诊断（trace），不进消费方契约。
+3. **平台模型**：桌面五类 / 移动粗信号+注入；hosts/proxy 桌面专属。
+4. **测试分层**：Tier1 单元注入（host）/ Tier2 VM 真事件（3 VM）/ Tier3 移动注入（host）。
+5. **切接（P4）**：待自身质量 + 测试完备后，单独出方案再动（不提前做）。
+
+## 8. 遗留（不阻塞）
+
+- P4 切接（zf 移除 network/system_proxy + 消费方改 import）——后续独立阶段。
+- Tier 2/3 真事件脚本落地（本轮实现）。

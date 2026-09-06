@@ -15,6 +15,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "tests",
         "CLAUDE.md",
         "README.md",
         "API.md",
