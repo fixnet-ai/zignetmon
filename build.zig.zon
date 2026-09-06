@@ -1,0 +1,23 @@
+.{
+    .name = .zignetmon,
+    .version = "0.1.0",
+    .fingerprint = 0x8d2056863c2fa135,
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        // 唯一实现源：net/endian/platform/alloc/log 一律 @import("zigfoundation")。
+        .zigfoundation = .{
+            .path = "../zigfoundation",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "CLAUDE.md",
+        "README.md",
+        "API.md",
+        "zigtester.yaml",
+    },
+}

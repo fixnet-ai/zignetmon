@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+codedb.snapshot
+*.o
+*.a
+zig-pkg/
