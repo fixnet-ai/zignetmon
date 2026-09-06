@@ -20,6 +20,14 @@
 - **dns_monitor 第 4 子监测**（`wvoojksfx`，用户裁定「补独立 DNS 监测」）：发现原实现 DNS 只在接口变化时重读、无独立事件源；补 `dns_monitor{,_darwin,_linux,_windows,_stub}.zig`（macOS SCDynamicStore DNS / Linux inotify resolv.conf / Windows 注册表 RegNotify）+ 门面 1s 合并去抖（接口+DNS 同变收敛为恰好一次）。
 - **验收**：`zig build test` 61/61 全绿（ReleaseSafe + Debug 泄漏检查）+ 交叉编译 linux/windows 通过 + `zig build real_event` 编译 + fmt 干净。commit `79f665e`。
 
+### 2026-09-07 — Tier2 VM 真机验证 + 2 bug 修复（workflow `wqfeqtfak` + agent）
+
+- **三 VM 真事件全 PASS**：macvm 2/2、linuxvm 3/3、windowsvm FINAL PASS（hosts/dns/proxy 真事件正确触发，非默认路由正确 0 伪信号）。
+- **bug1 hosts 误报**（linuxvm 暴露）：utm-monitor 守护进程对 /etc/hosts 做内容不变、仅 mtime bump 的保活重写，原纯 stat-diff 误判 → 修「stat 预筛 + 内容字节 diff」。
+- **bug2 proxy 漏报 + 门面盲去抖**（windowsvm 暴露）：proxy_monitor_windows 单次 RegNotify+INFINITE 等待 → 修有界 1s+周期重读兜底；门面 `dispatch()` 盲 1s 合并把「hosts restore→proxy set」独立真实事件误吞 → 修合并收窄到 network/dns 对、hosts/proxy 必达。
+- **测试脚本修复**：mac 脚本 ROOT 路径错 + CAN_SUDO 缺失（永远 SKIP）+ 路由子项从「期望≥1」改为「非默认路由 0 伪信号」负向断言。
+- commit `7a9fa09`（脚本）+ `ffd78f8`（3 个 src 修复）。
+
 ## 基线
 
 | 项 | 值 |
