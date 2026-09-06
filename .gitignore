@@ -4,3 +4,4 @@ codedb.snapshot
 *.o
 *.a
 zig-pkg/
+.vm-cache/

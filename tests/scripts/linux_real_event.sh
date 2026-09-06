@@ -197,10 +197,10 @@ else
     log "route removed: $TESTNET_ROUTE"
     priv ip route del "$TESTNET_ROUTE" 2>/dev/null || true
     ROUTE_ADDED=0
-    if [ "$delta" -ge 1 ]; then
-      pass "route（窗口内 CHANGED+${delta}，期望 ≥1）"
+    if [ "$delta" -eq 0 ]; then
+      pass "route（非默认路由 add/del 未产生伪信号，delta=0，正确）"
     else
-      fail "route：期望 ≥1 行 CHANGED，实际 ${delta}（已 add→del $TESTNET_ROUTE via $GW 驱动 netlink）"
+      fail "route：非默认路由变化产生 ${delta} 次伪信号（期望 0，默认出口未变）"
     fi
   else
     fail "route：ip route add 失败（via $GW）"

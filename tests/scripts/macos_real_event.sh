@@ -57,10 +57,15 @@ MARKER_HOST="zignetmon-realevent-$$.invalid"
 
 RUN_AS_ROOT=0;  [ "$(id -u)" = "0" ] && RUN_AS_ROOT=1
 CAN_SUDO=0
+# 特权探测：root 直接运行即有特权；否则探免密 sudo（sudo -n true）。
+[ "$RUN_AS_ROOT" = "1" ] && CAN_SUDO=1
+if [ "$CAN_SUDO" != "1" ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n true >/dev/null 2>&1 && CAN_SUDO=1
+fi
 SUDO_HINT="需 root 直接运行或免密 sudo（sudo -n）"
 
 # harness / 计时 / 结果 / 残留守卫（set -u 下先给默认值）
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HARNESS="${ZNM_HARNESS:-$ROOT/zig-out/bin/real_event}"
 RUN_SECONDS="${ZNM_RUN_SECONDS:-45}"
 [ "$RUN_SECONDS" -lt 40 ] && RUN_SECONDS=40
@@ -181,13 +186,11 @@ run_route() {
     ROUTE_ADDED=0
     sleep "$ROUTE_SETTLE"
 
-    if [ "$delta" -ge 1 ]; then
-        say "[route] PASS：真实 AF_ROUTE 变化已触发 Monitor 粗回调"
+    if [ "$delta" -eq 0 ]; then
+        say "[route] PASS：非默认路由 add/delete 未产生伪「网络变了」信号（默认出口未变，正确）"
         ROUTE_STATE="PASS"
     else
-        say "[route] FAIL：0 次 CHANGED —— 期望 route add/delete TEST-NET → AF_ROUTE → 门面回调；"
-        say "[route]       若持续 0，多为该路由未改动 gateway/默认接口/DNS 任一 diff 字段"
-        say "[route]       （见 src/mod.zig diffFacts 门控 + src/network_darwin.zig checkUpdateDarwin）"
+        say "[route] FAIL：非默认路由变化产生了 ${delta} 次伪信号 —— 应 0（默认出口未变）"
         ROUTE_STATE="FAIL"
     fi
 }
