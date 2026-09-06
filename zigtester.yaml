@@ -1,0 +1,35 @@
+project: zignetmon
+id: 7ce2e3de-5e35-4a22-b7c4-b2a4412a633c
+description: "网络变化监测与自适应库 — 五类事件 × 五平台事件源监测与归一化"
+
+# zignetmon 是纯库（无守护进程/插件对端），测试全部经 zig build test 单测执行，
+# 不依赖 local-echo / sing-box / xray-core 插件。
+# unit 层 counts：54/54（2026-09-07 实测；增删测试后同步注释即可，未设硬阈值护栏）。
+settings:
+  build_command: "zig build"
+
+levels:
+  unit:
+    - name: "all-tests"
+      # --summary all：zig 0.16 默认模式不输出测试计数行（"N pass (N total)"），
+      # zig_test parser 无法提取真实计数（会 fallthrough 误记 1/1）
+      command: "zig build test --summary all"
+      parser: zig_test
+      timeout: 180
+
+  functional:
+    # ⬇⬇⬇ 真实事件源占位（待 macvm，勿在本机启用）⬇⬇⬇
+    # 真实事件源测试需要改宿主网络状态（macOS sudo route 加删 TEST-NET 路由 →
+    # AF_ROUTE 事件 → network 门面回调 → 语义 diff），属特权操作，仅授权 macvm
+    # （同 zigbox tun-scenarios 先例：sudo: true，sudo 不可用自动 SKIP）。
+    # 脚本置 tests/ 下，register 后取消注释即可接入：
+    #
+    # - name: "net-event"
+    #   command: "python3 tests/test_net_event.py"
+    #   target: zignetmon   # 采真实被测进程（触发脚本另跑），非 python 驱动本身
+    #   timeout: 120
+    #   parser: line_count
+    #   sudo: true          # macOS sudo route 特权；sudo 不可用自动 SKIP（仅 macvm 执行）
+    #   env:
+    #     ZF_NETWORK_TRACE: "1"  # 全流程 info 日志，断言事件处理链
+    #   description: "真实网络事件源：sudo route 加删 TEST-NET 路由 → AF_ROUTE → 归一化 diff → 语义事件"

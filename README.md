@@ -22,12 +22,47 @@
 事件源层（平台后端） → 归一化层（快照 diff + 防抖去重） → 决策层（消费方自适应）
 ```
 
-## 快速开始
+## API 简介
+
+统一接入入口 = `Monitor` 门面：五类变化收敛到一个回调（`ChangeKind` + `Snapshot`），
+另可主动 `snapshot()` 查询当前快照。公共签名、子监测（hosts_monitor / proxy_monitor /
+network / system_proxy）与用法示例见 **[API.md](API.md)**。
+
+```zig
+const zm = @import("zignetmon");
+
+var mon = try zm.Monitor.init(allocator, .{}); // 路由/DNS/网卡/系统代理/hosts 三子监测就绪
+defer mon.deinit();
+try mon.start();                    // 启动全部事件源（幂等）
+try mon.subscribe(onChange, ctx);   // kind = route/default_route/interface/dns/proxy/hosts
+
+fn onChange(kind: zm.ChangeKind, snap: *const zm.Snapshot, ctx: ?*anyopaque) void {
+    // 收到变化 → 重测环境 → Session 重建（决策层由消费方实现）
+    std.log.info("[app] network change kind={s}", .{@tagName(kind)});
+}
+```
+
+> `Snapshot` 内 `default_interface` / `dns_servers` / `proxy.host` 为底层 monitor 内部缓冲的
+> **借用切片**，仅在下次事件前有效；持久持有须自行 dup（详见 API.md §2）。
+
+## 构建与测试
 
 ```bash
-zig build          # 构建库（ReleaseSafe）
-zig build test     # 运行单元测试
+zig build                    # 构建库（ReleaseSafe 默认）
+zig build test               # 单元测试（当前 54/54）
+zig build test -Doptimize=Debug   # 调试内存泄漏
 ```
+
+集成/回归测试一律经 zigtester 执行：
+
+```
+zigtester_list zignetmon           # 查看套件（unit/all-tests）
+zigtester_run zignetmon --level unit
+zigtester_history zignetmon all-tests   # 历史趋势
+```
+
+真实事件源（macOS `sudo route` → AF_ROUTE）functional 测试需特权，挂 macvm
+（`zigtester.yaml` functional 层已留占位注释），开发本机仅跑 NOTUN/unit。
 
 ## 依赖
 
@@ -36,7 +71,14 @@ zig build test     # 运行单元测试
 
 ## 可观测
 
-设置 `ZF_NETWORK_TRACE=1`，收到任何网络变化事件时打印全流程 info 日志，可还原一次变化的完整处理链。
+设置 `ZF_NETWORK_TRACE=1`，收到任何网络变化事件时打印全流程 **info** 日志，可还原一次
+变化的完整处理链：`事件源收到 → 归一化 diff → 去抖去重 → 事件分发`。默认关闭（无日志开销）；
+实现为门面内读 env 一次缓存（POSIX `getenv` / Windows `kernel32`），日志经 zf.log、前缀
+`[monitor]`/`[hosts]`/`[proxy]`、英文 ASCII。
+
+```bash
+ZF_NETWORK_TRACE=1 <消费方可执行文件>   # 运行时开启 trace
+```
 
 ## 参考实现
 
