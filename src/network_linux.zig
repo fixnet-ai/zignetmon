@@ -329,8 +329,9 @@ pub const DefaultInterfaceMonitor = struct {
         if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(SockaddrNl)) < 0) return;
 
         // Build RTM_GETRULE message: nlmsghdr + rtgenmsg{family=AF_UNSPEC}
-        var msg: [@sizeOf(NlMsgHdr) + 1]u8 = @splat(0);
-        const hdr: *NlMsgHdr = @ptrCast(&msg);
+        // 显式按 NlMsgHdr 对齐（android 分支首次被编译时暴露：@ptrCast 提升对齐需断言）
+        var msg: [@sizeOf(NlMsgHdr) + 1]u8 align(@alignOf(NlMsgHdr)) = @splat(0);
+        const hdr: *NlMsgHdr = @ptrCast(@alignCast(&msg));
         hdr.len = @intCast(msg.len);
         hdr.type = RTM_GETRULE;
         hdr.flags = NLM_F_REQUEST | NLM_F_DUMP;
@@ -346,7 +347,8 @@ pub const DefaultInterfaceMonitor = struct {
         _ = std.posix.system.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(std.posix.timeval));
 
         // 循环接收多段 netlink 响应，直到收到 NLMSG_DONE
-        var recv_buf: [4096]u8 = undefined;
+        // align(4)：netlink 消息头按 NLMSG_ALIGN 解析（offset 4 对齐，见下方推进）
+        var recv_buf: [4096]u8 align(4) = undefined;
         while (true) {
             const n = std.c.recv(sock, &recv_buf, recv_buf.len, 0); // netlink 监控面查询，非代理数据面 // io-audit: allow
             if (n <= @sizeOf(NlMsgHdr)) return;
@@ -354,7 +356,7 @@ pub const DefaultInterfaceMonitor = struct {
             // Parse netlink messages in the buffer
             var offset: usize = 0;
             while (offset + @sizeOf(NlMsgHdr) <= @as(usize, @intCast(n))) {
-                const msg_hdr: *const NlMsgHdr = @ptrCast(&recv_buf[offset]);
+                const msg_hdr: *const NlMsgHdr = @ptrCast(@alignCast(&recv_buf[offset]));
                 const msg_len = msg_hdr.len;
                 if (msg_len < @sizeOf(NlMsgHdr) or offset + msg_len > @as(usize, @intCast(n))) break;
 
