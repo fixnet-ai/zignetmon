@@ -225,7 +225,7 @@ pub const DnsMonitor = struct { // 平台实现经 Impl comptime 分派
 - **门面集成**：`Monitor` 订阅后经 `handleDns` 将快照 `dns_servers` 覆盖为 dns_monitor 新鲜值，
   与 network「接口 + DNS 同变」在门面 1s 去抖窗口合并 → 恰好一次粗回调。
 
-### 4.4 network 门面 `network`（高级；re-export 自 zf.network #43）
+### 4.4 network 门面 `network`（高级；源出 zigfoundation #43，P4 起本包为唯一实现源）
 
 全局单例 + 统一回调 + `NetworkInfo` 完整快照。事件源（AF_ROUTE / netlink / iphlpapi）
 与默认接口判定（平台分文件 + 1s 防抖）在内部消化。
@@ -260,7 +260,7 @@ pub fn queryAllAddresses(allocator: std.mem.Allocator) ![]types.IpAddr; // 枚�
 - 快照/回调的 `NetworkInfo` 指向单例内部缓冲，**下次 rebuild 前有效**。
 - 回调在防抖线程上下文触发（同步语义），禁止阻塞。
 
-### 4.5 系统代理副作用 `system_proxy`（re-export 自 zf.system_proxy #79）
+### 4.5 系统代理副作用 `system_proxy`（源出 zigfoundation #79，P4 起本包为唯一实现源）
 
 无状态原语：set / restore 宿主系统代理（系统代理 + 环境变量注入），供消费方自行编排。
 **与 `proxy_monitor` 不同**：本模块是「主动设置/恢复」的副作用，非监测。

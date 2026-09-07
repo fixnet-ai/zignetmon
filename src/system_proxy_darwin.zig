@@ -3,7 +3,7 @@
 //! 系统代理：networksetup 命令行（-setwebproxy/-setsecurewebproxy[/-setsocksfirewallproxy]），
 //! 对标 vendor/sing-box/common/settings/proxy_darwin.go。
 //! env 注入：~/.bashrc + ~/.zshrc（common.appendToShellRc/removeFromShellRc，双写）。
-//! 默认接口名：zf.network 快照 → zf.egress 索引 → if_indextoname（重建路径）。
+//! 默认接口名：本包 network 快照 → zf.egress 索引 → if_indextoname（重建路径）。
 //!
 //! 错误语义：setProxy 系统代理失败 → diag 累积命令 stderr → return error.EnableFailed；
 //! env 注入失败仅 append 诊断到 diag（软约束，不 fail）。
@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zf = @import("zigfoundation");
+const network = @import("network.zig");
 const common = @import("system_proxy_common.zig");
 
 const ProxyError = common.ProxyError;
@@ -137,12 +138,12 @@ fn getInterfaceDisplayName(device: []const u8, out: []u8) ?[]const u8 {
     return parseHardwarePort(output_buf[0..idx], device, out);
 }
 
-/// 当前默认接口名：优先 zf.network 快照（网络监控已启动时 — 重建路径），
-/// 首个 Session start 早于 core.run 的 zf.network.init/start，快照无数据，
+/// 当前默认接口名：优先本包 network 快照（网络监控已启动时 — 重建路径），
+/// 首个 Session start 早于 core.run 的 network.init/start，快照无数据，
 /// 降级到 zf.egress.getDefaultInterfaceIndex + if_indextoname（route 表探测，
 /// 与 egress 探测同源 — 两条路径结果一致）。
 fn defaultInterfaceName(out: []u8) ?[]const u8 {
-    const info = zf.network.snapshot();
+    const info = network.snapshot();
     if (info.default_interface) |iface| {
         if (iface.name_len > 0 and iface.name_len <= out.len) {
             @memcpy(out[0..iface.name_len], iface.name[0..iface.name_len]);

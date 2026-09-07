@@ -6,7 +6,7 @@
 //! 线程触发 callout → SCDynamicStoreCopyProxies 重读当前值 → diff → emit。
 //!
 //! 实现方式：**运行时 dlopen + dlsym** 解析 SystemConfiguration / CoreFoundation 符号
-//! （不引入 framework 链接依赖；@extern/mach symbol 先例见 zf.network）。符号解析
+//! （不引入 framework 链接依赖；@extern/mach symbol 解析先例见 zignetmon.network）。符号解析
 //! 在 init 时完成一次，解析失败（极端环境缺 framework）→ start no-op + snapshot null。
 //!
 //! iOS：同一 darwin 文件分发（design 语义 stub），但 SCDynamicStore 对沙箱 app 不可用，

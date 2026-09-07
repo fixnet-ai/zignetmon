@@ -24,7 +24,7 @@
 //!   - monitor_shared 类型 re-export → 直接从 types 取（文件内私有 const 别名，不 re-export）
 //!   - registerMyInterface → setExcludedInterfaces（[8]types.ExcludedInterface + count）
 //!   - tun.DefaultInterfaceMonitor vtable 构造 → 删除（TUN 耦合）
-//!   - 日志组件标识 [monitor] → [network]（zf.network 门面规范）
+//!   - 日志组件标识 [monitor] → [network]（zignetmon.network 门面规范）
 //!
 //! 参考文件:
 //!   - vendor/sing-tun/monitor_linux_default.go — 标准 Linux checkUpdate (非 Android)

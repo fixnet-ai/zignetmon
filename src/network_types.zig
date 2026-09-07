@@ -1,4 +1,4 @@
-//! network_types — zf.network 共享类型（门面与平台实现共用，避免循环 import）
+//! network_types — zignetmon.network 共享类型（门面与平台实现共用，避免循环 import）
 //!
 //! 从 zigtun monitor.zig 平移的跨平台共享类型：
 //!   - NetworkUpdateCallback / DefaultInterfaceUpdateCallback — 平台内部回调签名

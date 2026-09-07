@@ -1,6 +1,6 @@
 //! network_params — 网络参数查询（43-P3）
 //!
-//! 纯查询函数层，接入 zf.network 门面（system 查询 → NetworkInfo 快照）。
+//! 纯查询函数层，接入 zignetmon.network 门面（system 查询 → NetworkInfo 快照）。
 //! 只实现不优化：不做缓存、不做线程。out 缓冲由调用方提供；除
 //! queryAllAddresses（未知接口数 → 用调用方 allocator 动态列表）外，
 //! 函数内不分配内存（defaultInterfaceFinder 的 name 切片指向本模块静态缓冲，

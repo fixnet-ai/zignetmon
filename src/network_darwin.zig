@@ -878,7 +878,7 @@ test "network_darwin: setExcludedInterfaces + myInterface" {
 // ============================================================================
 // 真实事件源集成测试（winx64 返工复查 F5）— 驱动真实内核路由事件，禁止 mock
 // ============================================================================
-// 背景：zf.network 门面单测全部经 _onInterfaceChanged mock 直插状态层，从不经过
+// 背景：网络门面单测全部经 _onInterfaceChanged mock 直插状态层，从不经过
 // 事件层（network.zig:623-652）；macOS AF_ROUTE 真实事件源（路由套接字 → read →
 // emit → 注册回调）零自动化覆盖。Windows iphlpapi NotifyIpInterfaceChange 回调参数
 // 错位 bug 能潜伏，正是因为真实事件源→回调管道没有自动化测试。

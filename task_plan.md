@@ -14,12 +14,11 @@
 | P1 | 提取 zf 模块 | 12 文件（network + system_proxy）→ zignetmon + import 适配 + 独立构建单测绿 | ✅ 2026-09-07 |
 | P2 | 五类扩展（v2 简化：粗信号） | hosts 监测 + 系统代理变化监测 + 统一门面 diff；**v2 收敛为「网络变了」粗信号**（`ChangeKind` 六值降内部 trace 诊断，不进消费方契约）+ `Monitor.injectPlatformInfo` 注入入口 | ✅ 2026-09-07 |
 | P3 | 测试与验收（补三层测试） | Tier1 注入单测全绿(61/61) + **Tier2 VM 真事件 harness/驱动脚本** + **Tier3 移动注入** + zigtester.yaml + ZF_NETWORK_TRACE + API/README/CLAUDE 三层文档 + **`dns_monitor` 独立 DNS 监测（本补丁：DNS 独立事件源补门面-diff 附带覆盖）** | ✅ 2026-09-07 |
-| P4 | 切接 zf（后续） | zf 移除 network/system_proxy + 消费方改 @import("zignetmon")（独立阶段） | ⬜ |
+| P4 | 切接 zf（收敛唯一实现源） | zf 删 12 文件 + mod.zig 导出面；本包补 `network_params`/`network_types` 顶层 re-export（drop-in 对齐 zf 旧导出面）；生态消费方（zigtun/zigoutbounds/zigbox）import 改 `@import("zignetmon")`（订阅层 v1 纯搬迁，行为零变化；v2 Monitor 不接入） | ✅ 2026-09-07 |
 
 ## 遗留（不阻塞，后续 track）
 
 1. **iOS/Android no-op 语义（Tier3）**：hosts/proxy 移动 no-op 已由注入单测锁定；真实设备 E2E 为集成级、远期再说。
-2. **P4 切接**：zf 移除 network/system_proxy，消费方改 `@import("zignetmon")`（后续独立阶段，先自身质量完备）。
 
 ## VM 真机验证（2026-09-07，已闭环）
 
@@ -49,7 +48,7 @@
   Windows 注册表 Tcpip Parameters RegNotify / Linux inotify resolv.conf + mtime 兜底 / iOS no-op / Android stub）+ mod
   门面第 4 子监测（handleDns 覆盖快照 `dns_servers` 新鲜值，门面 1s 去抖合并收敛）。
 - **Tier2 VM 真机验证 ✅（09-07 闭环）**：macvm/linuxvm/windowsvm 三台真事件全 PASS，暴露并修复 2 个真机 bug（hosts 内容 diff + proxy 自愈/门面去抖收窄），见「VM 真机验证」段。
-- **下一步 = P4 切接（后续独立阶段）**：zf 移除 network/system_proxy，消费方改 `@import("zignetmon")`。
+- **P4 zf 切接 ✅（09-07 闭环）**：zf 删 12 文件 + 导出面；本包补 `network_params`/`network_types` 顶层 re-export（drop-in）；生态消费方（zigtun/zigoutbounds/zigbox）import 改 `@import("zignetmon")`——订阅层 v1 纯搬迁行为零变化，v2 Monitor 未接入（另立阶段）。生态收敛 grep 0 命中（代码/现架构文档层）；各仓 build/test 绿。
 
 ## 关键决策（已定，design.md §7 v2）
 
@@ -57,7 +56,7 @@
 2. **ChangeKind**：内部诊断（trace），不进消费方契约。
 3. **平台模型**：桌面五类 / 移动粗信号 + 注入；hosts/proxy 桌面专属。
 4. **测试分层**：Tier1 单元注入（host）/ Tier2 VM 真事件（3 VM）/ Tier3 移动注入（host）。
-5. **切接（P4）**：待自身质量 + 测试完备后，单独出方案再动（不提前做）。
+5. **切接（P4）**：原定「待自身质量 + 测试完备后，单独出方案再动（不提前做）」——已按此于 **09-07 执行闭环**（zf 删 12 文件，生态消费方 import 迁 zignetmon；见阶段表 P4 行）。
 
 ## 提取面（design.md §2）
 

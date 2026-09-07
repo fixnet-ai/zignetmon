@@ -1,8 +1,8 @@
 //! network — 网络状态统一门面（#43）
 //!
 //! 全局单例 + 统一回调 + NetworkInfo 完整快照。
-//! 上层使用者只接触本文件：
-//!   zf.network.init(allocator, opts) → start() → subscribe(cb, ctx)
+//! 上层使用者只接触本文件（消费方从 zignetmon.network 顶层导出引用）：
+//!   network.init(allocator, opts) → start() → subscribe(cb, ctx)
 //!   网络变化时回调收到 *const NetworkInfo；或随时 snapshot() 主动查询。
 //!
 //! 分层（详见 zigbox task_plan #43）：
@@ -83,7 +83,7 @@ pub const impl = switch (builtin.os.tag) {
     .macos, .ios => @import("network_darwin.zig"),
     .linux => @import("network_linux.zig"),
     .windows => @import("network_windows.zig"),
-    else => @compileError("zf.network: unsupported OS " ++ @tagName(builtin.os.tag)),
+    else => @compileError("zignetmon.network: unsupported OS " ++ @tagName(builtin.os.tag)),
 };
 
 // ============================================================================

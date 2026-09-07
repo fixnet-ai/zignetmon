@@ -28,15 +28,17 @@
 
 zignetmon **不是从零设计**，是「提取 + 扩展」：
 
-- **提取**：`zf.network`（#43，网络门面）+ `zf.system_proxy`（#79，系统代理副作用）已实现并历经
-  真机/VM/winx64 验证 → 抽出到本库适配 import 后独立构建。**提取面 12 文件清单 + import 适配规则
+- **提取**：zigfoundation 的网络门面（#43）+ 系统代理（#79）已实现并历经
+  真机/VM/winx64 验证 → P1 抽出到本库适配 import 后独立构建（**P4 起唯一实现源归本包，zf 已删原 12 文件**）。
+  **提取面 12 文件清单 + import 适配规则
   （机械替换表）见 `design.md` §2**（含验收：独立构建单测绿 + 日志前缀保留 `[network]` 防消费方 grep 失效）。
 - **扩展（v2 简化）**：补齐五类事件中缺失的「hosts 文件」「系统代理变化」监测 + 统一门面收敛
   为 **「网络变了」粗信号**——`ChangeKind` 六值降为内部 trace 诊断，**不进消费方契约**（design.md §5）。
 - **dns_monitor（本补丁）**：补系统 DNS **独立变化**监测（第 4 子监测，独立事件源，分平台
   darwin/windows/linux/stub）——此前 DNS 仅靠门面对 network 快照 diff 的附带监测；详见 `design.md` §3。
-- **切接**：本库成为唯一实现源后，zf 移除 network/system_proxy、消费方改 `@import("zignetmon")` ——
-  **切接是后续独立阶段，不在本库内做**。
+- **切接（P4，09-07 已闭环）**：本库现为网络监测/查询域**唯一实现源**——zf 已删原 12 文件（network +
+  system_proxy，仅保留 net/egress/endian/platform 等基础件），生态消费方（zigtun/zigoutbounds/zigbox）
+  已改 `@import("zignetmon")`（订阅层 v1 纯搬迁，行为零变化；v2 `Monitor` 门面未接入消费方，另立阶段）。
 
 ## 架构层次（三层，权威 = design.md §4）
 

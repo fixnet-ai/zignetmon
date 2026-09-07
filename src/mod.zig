@@ -45,10 +45,15 @@ const builtin = @import("builtin");
 const zf = @import("zigfoundation");
 const ntypes = @import("network_types.zig"); // 仅门面内部（Facts 物化）引用
 
-/// 网络门面（单例 + 回调 + 快照）。移植自 zf.network（#43）。
+/// 网络门面（单例 + 回调 + 快照）。网络监测/查询域唯一实现源（#43，P4 自 zigfoundation 整体迁入归位）。
 pub const network = @import("network.zig");
 
-/// 宿主系统代理副作用（set/restore 原语）。移植自 zf.system_proxy（#79）。
+/// 轻量查询原语 / 共享纯类型顶层 re-export（drop-in：与 zf 已删旧导出面同名同形，
+/// P4 后消费方统一从本包取，杜绝跨包二次实现）。
+pub const network_params = @import("network_params.zig");
+pub const network_types = @import("network_types.zig");
+
+/// 宿主系统代理副作用（set/restore 原语）。系统代理域唯一实现源（#79，P4 同上迁入归位）。
 pub const system_proxy = @import("system_proxy.zig");
 
 /// hosts 文件变化监测（跨平台后台线程 stat diff）。
