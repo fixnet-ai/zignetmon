@@ -1,6 +1,6 @@
 # Findings: zignetmon — 网络变化监测与自适应
 
-> 研究权威：`/tmp/zignetmon-research/*.md`（六份参考项目研究笔记，workflow `wcc76ycpr` 产出）。本文件沉淀**可指导设计的定论**。
+> 研究权威：`/tmp/zignetmon-research/*.md`（六份参考项目研究笔记，workflow `wcc76ycpr` 产出）（临时路径，或已失效）。本文件沉淀**可指导设计的定论**。
 
 ## 研究综合（6 参考项目关键共识）
 

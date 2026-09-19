@@ -22,33 +22,21 @@
 
 ## VM 真机验证（2026-09-07，已闭环）
 
-三 VM 真事件验证**全部 PASS**，暴露并修复 2 个真实 bug（真机才触发的低概率边界）：
+三 VM 真事件验证**全部 PASS**：macvm 2/2（route 非默认路由 0 伪信号 + hosts 1 信号）、linuxvm 3/3（route 0 伪信号 + resolv DNS 1 信号 + hosts 1 信号）、windowsvm FINAL PASS（route INFO 0 + hosts 1 + proxy 2）。修复 2 个真机才触发的 bug（commit `ffd78f8`）：
 
-| VM | 结果 | 子项 |
-|----|------|------|
-| macvm | 2/2 PASS | route（非默认路由 0 伪信号，正确）+ hosts（1 信号） |
-| linuxvm | 3/3 PASS | route（0 伪信号）+ resolv DNS（1 信号，dns_monitor）+ hosts（1 信号） |
-| windowsvm | FINAL PASS | route INFO（0，正确）+ hosts（1）+ proxy（2，proxy_monitor） |
-
-**修复的 2 个 bug（commit `ffd78f8`）**：
-1. **hosts 误报**（linuxvm 暴露）：linuxvm 的 utm-monitor 守护进程每 ~30s 对 `/etc/hosts` 做**内容字节不变、仅 mtime bump** 的保活重写，原 hosts_monitor 纯 stat-diff（mtime/size）把它误判为「hosts 变化」→ 门面误发「网络变了」。修复 = 「stat 预筛 + 内容字节 diff 确认」，仅真内容变化才 emit（读失败 fail-open 宁多报不漏报）。
+1. **hosts 误报**（linuxvm 暴露）：utm-monitor 守护进程每 ~30s 对 `/etc/hosts` 做**内容字节不变、仅 mtime bump** 的保活重写，原 hosts_monitor 纯 stat-diff（mtime/size）误判为「hosts 变化」→ 门面误发「网络变了」。修复 = 「stat 预筛 + 内容字节 diff 确认」，仅真内容变化才 emit（读失败 fail-open 宁多报不漏报）。
 2. **proxy 漏报 + 门面盲去抖**（windowsvm 暴露）：① proxy_monitor_windows 原单次 RegNotifyChangeKeyValue + INFINITE 等待，事件丢失即永久漏报；修复 = 有界 1s 等待 + 周期重读 diff 兜底 + 递归子树。② 门面 `Monitor.dispatch()` 原盲 1s 合并去抖把「hosts restore（<1s 前）→ proxy set（紧随）」的独立真实事件误吞；修复 = 合并收窄到「仅 network/dns 这一对连通性重叠源」，hosts/proxy 作为独立去重源**必达**不参与合并。
 
-真机验证结论：`hosts_monitor`（三平台）、`dns_monitor`（linux resolv）、`proxy_monitor`（windows 注册表）真实事件均正确触发；非默认路由增删正确不产生伪信号（默认出口未变）。
+结论：`hosts_monitor`（三平台）、`dns_monitor`（linux resolv）、`proxy_monitor`（windows 注册表）真实事件均正确触发；非默认路由增删正确不产生伪信号。
 
 ## 当前状态（2026-09-07）
 
-- **P0 骨架 ✅** / **P1 提取 ✅**（提取面 12 文件 + import 适配，独立构建单测绿）。
-- **P2 v2 简化 ✅**：门面从「5 类语义事件（ChangeKind 回调）」收敛为 **「网络变了」粗回调**
-  `Callback(Snapshot)`；`ChangeKind` 移出 mod 顶层导出、降为内部 trace 诊断；新增
-  `Monitor.injectPlatformInfo`（移动 iOS NE / Android 桥 + 测试注入，走真实事件同 diff/dispatch 路径）。
-- **P3 三层测试 ✅**：`zig build test` 61/61（含注入路径 + dns_monitor 独立变化）+ `zig fmt` 干净 + zigtester.yaml（unit/all-tests）
-  + API/README/CLAUDE 三层测试文档；Tier2 真事件 harness + 三平台驱动脚本落地 `tests/`（挂 vm-regression 白名单）。
-- **dns_monitor 独立 DNS 监测 ✅（本补丁）**：`src/dns_monitor*.zig`（macOS SCDynamicStore「Global/DNS」/
-  Windows 注册表 Tcpip Parameters RegNotify / Linux inotify resolv.conf + mtime 兜底 / iOS no-op / Android stub）+ mod
-  门面第 4 子监测（handleDns 覆盖快照 `dns_servers` 新鲜值，门面 1s 去抖合并收敛）。
-- **Tier2 VM 真机验证 ✅（09-07 闭环）**：macvm/linuxvm/windowsvm 三台真事件全 PASS，暴露并修复 2 个真机 bug（hosts 内容 diff + proxy 自愈/门面去抖收窄），见「VM 真机验证」段。
-- **P4 zf 切接 ✅（09-07 闭环）**：zf 删 12 文件 + 导出面；本包补 `network_params`/`network_types` 顶层 re-export（drop-in）；生态消费方（zigtun/zigoutbounds/zigbox）import 改 `@import("zignetmon")`——订阅层 v1 纯搬迁行为零变化，v2 Monitor 未接入（另立阶段）。生态收敛 grep 0 命中（代码/现架构文档层）；各仓 build/test 绿。
+> P0-P4 全部 ✅ 闭环（逐阶段明细见上方「阶段」表，不再逐条复述）。增量要点：
+
+- 门面 = **「网络变了」粗回调** `Callback(Snapshot)`；`ChangeKind` 移出 mod 顶层导出、降内部 trace 诊断；`Monitor.injectPlatformInfo`（移动 iOS NE / Android 桥 + 测试注入，走真实事件同 diff/dispatch 路径）。
+- 测试：`zig build test` 61/61（含注入路径 + dns_monitor 独立变化）+ `zig fmt` 干净 + zigtester.yaml（unit/all-tests）+ API/README/CLAUDE 三层文档；Tier2 真事件 harness + 三平台驱动脚本落地 `tests/`（挂 vm-regression 白名单）。
+- dns_monitor 第 4 子监测（`src/dns_monitor*.zig`）：macOS SCDynamicStore「Global/DNS」/ Windows 注册表 Tcpip Parameters RegNotify / Linux inotify resolv.conf + mtime 兜底 / iOS no-op / Android stub；门面 handleDns 覆盖快照 `dns_servers` 新鲜值，1s 去抖合并收敛。
+- P4 zf 切接后生态收敛 grep 0 命中（代码/现架构文档层），各仓 build/test 绿；v2 Monitor 未接入消费方（另立阶段）。
 
 ## 关键决策（已定，design.md §7 v2）
 
