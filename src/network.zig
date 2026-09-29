@@ -5,7 +5,7 @@
 //!   network.init(allocator, opts) → start() → subscribe(cb, ctx)
 //!   网络变化时回调收到 *const NetworkInfo；或随时 snapshot() 主动查询。
 //!
-//! 分层（详见 zigbox task_plan #43）：
+//! 分层（详见 kisscore task_plan #43）：
 //!   - 事件层 NetworkUpdateMonitor: mac/iOS AF_ROUTE · Linux/Android netlink · Win iphlpapi
 //!   - 状态层 DefaultInterfaceMonitor: 默认接口跟踪 + 1s 防抖 + noRoute 语义
 //!   - 查询层 network_params: 地址/网关/DNS/链路参数
@@ -302,7 +302,7 @@ pub fn unsubscribe(callback: NetworkChangeCallback, ctx: ?*anyopaque) void {
 // ============================================================================
 
 /// 查询当前默认网关（IPv4）。底层 network_params.queryGateway()，无单例依赖——
-/// 供一次性 CLI/诊断路径（如 zigbox envinfo --version）在引擎初始化前使用；
+/// 供一次性 CLI/诊断路径（如 kisscore envinfo --version）在引擎初始化前使用；
 /// 常驻路径优先 snapshot().gateway（订阅快照，含注入覆盖）。
 pub fn queryDefaultGateway() ?types.IpAddr {
     return params.queryGateway();

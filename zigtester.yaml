@@ -23,7 +23,7 @@ levels:
     # ⬇⬇⬇ 真实事件源占位（Tier2，勿在本机启用）⬇⬇⬇
     # 真实事件源测试需改宿主网络状态（route / resolv / hosts / 系统代理）+ root 特权，
     # 且 hosts/proxy 在各平台分别驱动 stat diff / RegNotify 等真实 OS 事件 —— 属特权操作，
-    # 仅授权各自 VM（macvm / linuxvm / windowsvm），同 zigbox tun-scenarios 先例（sudo: true，
+    # 仅授权各自 VM（macvm / linuxvm / windowsvm），同 kisscore tun-scenarios 先例（sudo: true，
     # sudo 不可用自动 SKIP）。前置先构建订阅 harness：zig build real_event →
     # zig-out/bin/real_event（tests/real_event_harness.zig，每次粗回调打一行 CHANGED）。
     #
@@ -32,7 +32,7 @@ levels:
     #   linuxvm   tests/scripts/linux_real_event.sh      [route] ip route / [resolv] / [hosts]
     #   windowsvm tests/scripts/windows_real_event.ps1   [route] netsh(INFO) / [hosts] / [proxy] RegNotify
     #
-    # 接入方式：三 VM 脚本挂 vm-regression 白名单调度（zigbox tests/vm/vm-regression.sh 先例）。
+    # 接入方式：三 VM 脚本挂 vm-regression 白名单调度（kisscore tests/vm/vm-regression.sh 先例）。
     # 各 VM 对应的 zigtester 套件占位（register 后取消注释，且仅经 vm-regression 在 VM 上启用）：
     #
     # - name: "net-event-macos"

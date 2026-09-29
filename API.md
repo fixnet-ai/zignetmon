@@ -1,7 +1,7 @@
 # API — zignetmon 网络变化监测与自适应库
 
 > 架构权威 = `design.md`；阶段进度 = `task_plan.md`。本文件是公共 API 的唯一权威文档。
-> 消费方（zigbox 等）`@import("zignetmon")` 集成，无需了解平台后端内部。
+> 消费方（kiss-core 等）`@import("zignetmon")` 集成，无需了解平台后端内部。
 
 ## 总览：一行接入
 
@@ -288,7 +288,7 @@ pub fn normalizeProxyHost(listen: []const u8) []const u8; // unspecified(0.0.0.0
 - 运行时设置示例：
 
 ```bash
-ZF_NETWORK_TRACE=1 zigbox -c config.json   # 消费方进程开启 trace
+ZF_NETWORK_TRACE=1 kiss-core -c config.json   # 消费方进程开启 trace
 ```
 
 预期 trace 输出形态（示意）：
@@ -333,7 +333,7 @@ zig build test -Doptimize=Debug # 调试内存泄漏
   - `tests/scripts/linux_real_event.sh` — route（netlink）/ resolv.conf / hosts
   - `tests/scripts/windows_real_event.ps1` — route（INFO）+ hosts + 代理（RegNotify）
 - **断言**：触发真实 OS 事件后，运行窗口内日志新增 ≥1 行 CHANGED，且快照反映新状态。
-- 三 VM 经 vm-regression 白名单接入（zigbox `tests/vm/vm-regression.sh` 先例）。脚本会临时改
+- 三 VM 经 vm-regression 白名单接入（kiss-core `tests/vm/vm-regression.sh` 先例）。脚本会临时改
   系统路由 / hosts / resolv（随即恢复），**开发本机禁止执行**。
 
 ### Tier 3 — 移动端（iOS / Android，注入为主，无真机）

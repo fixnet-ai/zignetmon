@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-**zignetmon** 是 fixnet 生态的「网络变化监测与自适应」库，从 zigfoundation 分离出来的独立兄弟项目（同 zigstack 先例）。目标一句话：**当用户的关键网络设置变化时，消费方（zigbox 等）重新适应新的网络环境，服务不断线。**
+**zignetmon** 是 fixnet 生态的「网络变化监测与自适应」库，从 zigfoundation 分离出来的独立兄弟项目（同 zigstack 先例）。目标一句话：**当用户的关键网络设置变化时，消费方（kiss-core 等）重新适应新的网络环境，服务不断线。**
 
 覆盖五类关键网络设置变化 × 五平台：
 
@@ -37,7 +37,7 @@ zignetmon **不是从零设计**，是「提取 + 扩展」：
 - **dns_monitor（本补丁）**：补系统 DNS **独立变化**监测（第 4 子监测，独立事件源，分平台
   darwin/windows/linux/stub）——此前 DNS 仅靠门面对 network 快照 diff 的附带监测；详见 `design.md` §3。
 - **切接（P4，09-07 已闭环）**：本库现为网络监测/查询域**唯一实现源**——zf 已删原 12 文件（network +
-  system_proxy，仅保留 net/egress/endian/platform 等基础件），生态消费方（zigtun/zigoutbounds/zigbox）
+  system_proxy，仅保留 net/egress/endian/platform 等基础件），生态消费方（zigtun/zigoutbounds/kiss-core）
   已改 `@import("zignetmon")`（订阅层 v1 纯搬迁，行为零变化；v2 `Monitor` 门面未接入消费方，另立阶段）。
 
 ## 架构层次（三层，权威 = design.md §4）
@@ -47,7 +47,7 @@ zignetmon **不是从零设计**，是「提取 + 扩展」：
         ↓ 裸事件
 ② 归一化层（门面）     mod.zig：快照比对 → diff → 去抖去重 → 「网络变了」粗信号
         ↓ 回调(Snapshot)（ChangeKind 仅 ZF_NETWORK_TRACE 内部诊断）
-③ 决策层（消费方）     zigbox 等：收到「网络变了」→ 重读快照 → 重置自身状态
+③ 决策层（消费方）     kiss-core 等：收到「网络变了」→ 重读快照 → 重置自身状态
 ```
 
 **平台能力矩阵（桌面五类 / 移动粗信号 + 注入）→ `design.md` §3**；API 契约 v2（粗回调 +

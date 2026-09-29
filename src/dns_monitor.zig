@@ -2,7 +2,7 @@
 //!
 //! 目标：补「系统 DNS 独立变化」缺口——DNS 在路由/网卡未变时单独被改（改 resolv.conf /
 //! 系统设置 DNS / 注册表 NameServer），以回调通知上层（并支持主动 `snapshot()` 读取当前
-//! 生效值），供消费方（zigbox 等）重新适应（如重建 DNS 上游 / FakeIP 后端）。
+//! 生效值），供消费方（kisscore 等）重新适应（如重建 DNS 上游 / FakeIP 后端）。
 //!
 //! 本文件仅做 **comptime 平台分派 + 公共类型**。真正的事件源在平台文件：
 //!   - macOS  (dns_monitor_darwin.zig)：SCDynamicStore 监听

@@ -3,7 +3,7 @@
 ## Goal
 
 生产级网络变化监测与自适应库：覆盖「路由 / 系统 DNS / 任意网卡 / 系统代理 / hosts 文件」五类关键网络设置变化（桌面
-三 OS 全量；iOS / Android 以粗信号 + 注入承载，能力矩阵见 `design.md` §3），消费方（zigbox 等）
+三 OS 全量；iOS / Android 以粗信号 + 注入承载，能力矩阵见 `design.md` §3），消费方（kiss-core 等）
 `@import("zignetmon")` 集成后，网络环境变化时服务重新自适应不断线。
 
 ## 阶段
@@ -14,7 +14,7 @@
 | P1 | 提取 zf 模块 | 12 文件（network + system_proxy）→ zignetmon + import 适配 + 独立构建单测绿 | ✅ 2026-09-07 |
 | P2 | 五类扩展（v2 简化：粗信号） | hosts 监测 + 系统代理变化监测 + 统一门面 diff；**v2 收敛为「网络变了」粗信号**（`ChangeKind` 六值降内部 trace 诊断，不进消费方契约）+ `Monitor.injectPlatformInfo` 注入入口 | ✅ 2026-09-07 |
 | P3 | 测试与验收（补三层测试） | Tier1 注入单测全绿(61/61) + **Tier2 VM 真事件 harness/驱动脚本** + **Tier3 移动注入** + zigtester.yaml + ZF_NETWORK_TRACE + API/README/CLAUDE 三层文档 + **`dns_monitor` 独立 DNS 监测（本补丁：DNS 独立事件源补门面-diff 附带覆盖）** | ✅ 2026-09-07 |
-| P4 | 切接 zf（收敛唯一实现源） | zf 删 12 文件 + mod.zig 导出面；本包补 `network_params`/`network_types` 顶层 re-export（drop-in 对齐 zf 旧导出面）；生态消费方（zigtun/zigoutbounds/zigbox）import 改 `@import("zignetmon")`（订阅层 v1 纯搬迁，行为零变化；v2 Monitor 不接入） | ✅ 2026-09-07 |
+| P4 | 切接 zf（收敛唯一实现源） | zf 删 12 文件 + mod.zig 导出面；本包补 `network_params`/`network_types` 顶层 re-export（drop-in 对齐 zf 旧导出面）；生态消费方（zigtun/zigoutbounds/kiss-core）import 改 `@import("zignetmon")`（订阅层 v1 纯搬迁，行为零变化；v2 Monitor 不接入） | ✅ 2026-09-07 |
 
 ## 遗留（不阻塞，后续 track）
 

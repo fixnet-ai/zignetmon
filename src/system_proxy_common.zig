@@ -50,8 +50,8 @@ pub fn normalizeProxyHost(listen: []const u8) []const u8 {
 // 环境变量注入（shell rc marker 区间）
 // ============================================================================
 
-pub const MARKER_BEGIN = "# >>> zigbox system proxy (set_system_proxy) >>>";
-pub const MARKER_END = "# <<< zigbox system proxy (set_system_proxy) <<<";
+pub const MARKER_BEGIN = "# >>> kisscore system proxy (set_system_proxy) >>>";
+pub const MARKER_END = "# <<< kisscore system proxy (set_system_proxy) <<<";
 
 /// no_proxy 值：127.0.0.1 防回环（全平台必设，用户拍板 2026-08-23）。
 pub const NO_PROXY_VALUE = "127.0.0.1,localhost,::1";
