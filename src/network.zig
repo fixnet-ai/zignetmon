@@ -61,6 +61,10 @@ pub const NetworkChangeCallback = *const fn (info: *const NetworkInfo, ctx: ?*an
 /// 排除接口（原 zigtun registerMyInterface：多 TUN 实例排除自身防路由循环）
 pub const ExcludedInterface = types.ExcludedInterface;
 
+/// 接口类型分类（S12）：默认路由接口的分类 = 消费方「网络类型」显示口径。
+pub const InterfaceKind = types.InterfaceKind;
+pub const classifyInterfaceName = types.classifyInterfaceName;
+
 pub const Opt = struct {
     /// iOS NetworkExtension 内运行时设为 true（sysctl 等 API 不可用，走 socket 回退）
     under_network_extension: bool = false,
