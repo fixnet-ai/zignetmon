@@ -36,12 +36,25 @@ pub const ChangeFlags = packed struct(u8) {
     _pad: u5 = 0,
 };
 
+/// 三端同名网络事件语义（2026-11-10 网络变化=完全重生重构）：门面在上次
+/// 快照对比后派生，消费方（kc 引擎 / 三端壳层状态机）不各自重推。
+pub const EventKind = enum {
+    /// 物理出口指纹变化（有可用出口前提下的换接口/换网段）
+    changed,
+    /// 不可用 → 可用（含进程启动后首次拿到默认出口）
+    available,
+    /// 可用 → 不可用（路由丢失 / 无默认出口）
+    lost,
+};
+
 /// 网络状态快照 — 回调参数与 snapshot() 返回共用
 pub const NetworkInfo = struct {
     default_interface: ?Interface = null,
     gateway: ?types.IpAddr = null,
     dns_servers: []const types.IpAddr = &.{},
     flags: ChangeFlags = .{},
+    /// 派生事件语义（rebuildLocked 内对比 last_available 产出）
+    event: EventKind = .changed,
     /// Android VPN 状态（非 Android 平台恒 false）
     android_vpn_enabled: bool = false,
 };
@@ -145,6 +158,8 @@ const State = struct {
     dns_buf: [MAX_DNS_SERVERS]types.IpAddr = undefined,
     dns_count: usize = 0,
     info: NetworkInfo = .{},
+    /// 上次快照是否有可用默认出口（EventKind 派生基准；false 起步=首次拿到接口算 available）
+    last_available: bool = false,
 };
 
 var g_mutex: foundation.sync.Mutex = .{};
@@ -299,6 +314,25 @@ pub fn unsubscribe(callback: NetworkChangeCallback, ctx: ?*anyopaque) void {
             node = cb.next;
         }
     }
+}
+
+/// 运行期追加排除接口（NE/VpnService 解禁用，2026-11-10 网络变化=完全重生重构）：
+/// 引擎建立 TUN 后把自身接口名注册进来，状态层从此忽略它——替代旧
+/// is_ne_provider「整体跳过订阅」的粗粒度隔离（自身隧道事件不再触发回调，
+/// 但物理出口变化照常通知）。幂等：重名/超容量静默忽略。
+pub fn addExcludedInterface(name: []const u8) void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (!g_inited) return;
+    const st = &g_state;
+    if (st.excluded_count >= MAX_EXCLUDED) return;
+    for (st.excluded[0..st.excluded_count]) |e| {
+        if (std.mem.eql(u8, e.name, name)) return;
+    }
+    const dup = st.allocator.dupe(u8, name) catch return;
+    st.excluded[st.excluded_count] = .{ .name = dup, .index = 0 };
+    st.excluded_count += 1;
+    st.iface_monitor.setExcludedInterfaces(st.excluded[0..st.excluded_count]);
 }
 
 // ============================================================================
@@ -515,13 +549,18 @@ fn rebuildLocked(iface: ?*const types.NetworkInterface, platform_flags: i32) voi
         // 路由丢失（平台状态层以空接口 index=0 表示，参考 sing-tun monitor_shared.go
         // noRoute 路径 emit nil interface）：清空默认接口
         flags.no_route = true;
+        st.last_available = false;
         st.info = .{
             .flags = flags,
+            .event = .lost,
             .android_vpn_enabled = st.iface_monitor.isAndroidVPNEnabled(),
         };
         return;
     }
 
+    // 有可用默认出口：上次不可用 = 恢复（available），否则 = 指纹变化（changed）
+    const was_available = st.last_available;
+    st.last_available = true;
     flags.interface_changed = true;
     const src = iface.?;
     var dst = Interface{
@@ -545,6 +584,7 @@ fn rebuildLocked(iface: ?*const types.NetworkInterface, platform_flags: i32) voi
         .gateway = if (st.injected.has_gateway) st.injected.gateway else params.queryGateway(),
         .dns_servers = dnsLocked(),
         .flags = flags,
+        .event = if (was_available) .changed else .available,
         .android_vpn_enabled = st.iface_monitor.isAndroidVPNEnabled(),
     };
 }
@@ -719,4 +759,41 @@ test "network: Android VPN 标志透传" {
     _onInterfaceChanged(&mock, types.FlagAndroidVPNUpdate);
     const snap = snapshot();
     try testing.expect(snap.flags.android_vpn);
+}
+
+test "network: EventKind 三事件派生 — 首接=available，换口=changed，丢路由=lost，恢复=available" {
+    _testReset();
+    defer _testReset();
+    try init(testing.allocator, .{});
+
+    // 首次拿到默认出口（进程播种）= available
+    var en0 = types.NetworkInterface{ .index = 5, .mtu = 1500, .name_len = 3 };
+    @memcpy(en0.name[0..3], "en0");
+    _onInterfaceChanged(&en0, 0);
+    try testing.expectEqual(EventKind.available, snapshot().event);
+
+    // 有出口前提下换接口 = changed
+    var en1 = types.NetworkInterface{ .index = 6, .mtu = 1500, .name_len = 3 };
+    @memcpy(en1.name[0..3], "en1");
+    _onInterfaceChanged(&en1, 0);
+    try testing.expectEqual(EventKind.changed, snapshot().event);
+
+    // 路由丢失 = lost
+    _onInterfaceChanged(null, 0);
+    try testing.expectEqual(EventKind.lost, snapshot().event);
+
+    // 不可用后恢复 = available（不是 changed）
+    _onInterfaceChanged(&en0, 0);
+    try testing.expectEqual(EventKind.available, snapshot().event);
+}
+
+test "network: addExcludedInterface 运行期追加 — 幂等且不泄漏" {
+    _testReset();
+    defer _testReset(); // 释放运行期 dup — testing.allocator 检测泄漏
+    try init(testing.allocator, .{ .excluded_interfaces = &.{.{ .name = "utun3", .index = 0 }} });
+
+    addExcludedInterface("utun9");
+    addExcludedInterface("utun9"); // 重名幂等
+    addExcludedInterface("utun3"); // 与 init 项重名幂等
+    // 断言经由 init opts 与运行期追加合计 2 条（无公开计数面；以不崩溃+不泄漏为判据）
 }

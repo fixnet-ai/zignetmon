@@ -515,60 +515,25 @@ pub const DefaultInterfaceMonitor = struct {
         }
     }
 
-    /// iOS NetworkExtension 回退: 通过 connect + getsockname + getifaddrs 获取默认接口
-    /// (参考 monitor_darwin.go:183-225 getDefaultInterfaceBySocket)
+    /// iOS NetworkExtension 回退: 物理接口枚举法获取默认接口
+    /// （2026-11-10 网络变化=完全重生重构重写；旧 UDP connect+getsockname 探测
+    /// 在 NE 内被自身 utun 污染——内核为探测 socket 选的路由接口=自身隧道，
+    /// 恒选中自己 ⇒ 回调 → 重建 → 新 utun 自激励循环（macvm 09-12 实锚 13 次）。
+    /// 枚举判据与 appex 宿主探针唯一同构（PacketTunnelProvider.egressFingerprintNow）：
+    /// en*/pdp_ip* 的 UP + 非链路本地 IPv4；169.254/16 不算「有出口」（Wi-Fi
+    /// 关闭后 en0 常留自配地址）。选择序 = Wi-Fi（en* 字典序小者优先）→ 蜂窝）
     fn checkUpdateViaSocket(self: *DefaultInterfaceMonitor) !void {
-        // 步骤 1: 创建 UDP socket 探测默认路由
-        const SOCK_DGRAM: u32 = 2;
-        const sock = std.c.socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) return error.SocketFailed;
-        defer foundation.socket.closeSocket(sock);
-
-        // 步骤 2: connect 到公网 DNS (不实际发包，内核仅确定路由接口)
-        const candidate_gateways = [_][4]u8{
-            .{ 1, 1, 1, 1 },
-            .{ 8, 8, 8, 8 },
-            .{ 192, 168, 1, 1 },
-            .{ 10, 0, 0, 1 },
-        };
-        var connected: bool = false;
-        for (candidate_gateways) |gw| {
-            var target: [16]u8 = [_]u8{0} ** 16;
-            target[0] = 16; // sin_len
-            target[1] = @intCast(AF_INET & 0xFF); // sin_family
-            foundation.endian.writeIntBig(u16, target[2..4], 53); // sin_port = 53
-            @memcpy(target[4..8], &gw); // sin_addr
-            // UDP connect 仅在内核关联对端地址，不发包不阻塞（等价 getsockname 的 setup 语义）
-            if (std.c.connect(sock, @ptrCast(&target), 16) == 0) { // io-audit: allow
-                connected = true;
-                break;
-            }
-        }
-        if (!connected) return error.NoDefaultRoute;
-
-        // 步骤 3: getsockname 获取内核选择的本地源地址
-        var local: [16]u8 = [_]u8{0} ** 16;
-        var local_len: u32 = 16;
-        if (std.c.getsockname(sock, @ptrCast(&local), &local_len) < 0) {
-            return error.NoDefaultRoute;
-        }
-
-        // BSD sockaddr_in: addr 在偏移 4..8 (skip sin_len + sin_family + sin_port)
-        const local_ip_nbo: u32 = @bitCast(local[4..8].*);
-
-        // 步骤 4: getifaddrs 查找匹配此 IP 的接口
-        const if_index = try findInterfaceIndexByAddr(local_ip_nbo);
-        const if_info = self.interface_finder(if_index) catch {
+        const pick = pickPhysicalInterface() orelse return error.NoDefaultRoute;
+        const if_info = self.interface_finder(pick.index) catch {
             return error.InterfaceNotFound;
         };
 
-        // 步骤 5: 构建 NetworkInterface 并 emit
         var new_iface = NetworkInterface{
-            .index = if_index,
+            .index = pick.index,
             .mtu = if_info.mtu,
-            .name_len = @min(if_info.name.len, 63),
+            .name_len = @min(pick.name_len, 63),
         };
-        @memcpy(new_iface.name[0..new_iface.name_len], if_info.name);
+        @memcpy(new_iface.name[0..new_iface.name_len], pick.name_buf[0..pick.name_len]);
 
         self.interface_lock.lock();
         defer self.interface_lock.unlock();
@@ -580,35 +545,86 @@ pub const DefaultInterfaceMonitor = struct {
         self.emit(&new_iface, 0);
     }
 
-    /// 通过 getifaddrs 查找拥有指定 IPv4 地址的接口索引
-    fn findInterfaceIndexByAddr(ip_nbo: u32) !u32 {
+    /// getifaddrs 枚举挑物理出口（NE 判据：白名单 en*/pdp_ip* + UP + 非链路本地 v4）。
+    const PhysicalPick = struct { index: u32, name_buf: [16]u8, name_len: usize };
+
+    fn pickPhysicalInterface() ?PhysicalPick {
         const libc = struct {
             extern "c" fn getifaddrs(ifap: *?*anyopaque) c_int;
             extern "c" fn freeifaddrs(ifap: ?*anyopaque) void;
         };
 
         var ifap: ?*anyopaque = null;
-        if (libc.getifaddrs(&ifap) != 0) return error.GetIfAddrsFailed;
+        if (libc.getifaddrs(&ifap) != 0) return null;
         defer libc.freeifaddrs(ifap);
 
-        var current = ifap;
-        while (current) |ptr| : (current = @as(*align(1) const IfAddrsBsd, @ptrCast(ptr)).next) {
-            const ifa = @as(*align(1) const IfAddrsBsd, @ptrCast(ptr));
+        // 每接口聚合（同接口多地址族多条记录）：是否 UP、是否有有效 v4
+        const N = 16;
+        var names: [N][16]u8 = undefined;
+        var lens: [N]usize = undefined;
+        var is_up: [N]bool = @splat(false);
+        var has_v4: [N]bool = @splat(false);
+        var n: usize = 0;
+
+        var current: ?*align(1) const IfAddrsBsd = @ptrCast(ifap);
+        while (current) |ptr| : (current = ptr.next) {
+            const ifa = ptr;
             const addr_ptr = ifa.addr orelse continue;
 
-            const family_byte = @as([*]const u8, @ptrCast(@alignCast(addr_ptr)))[1];
-            if (family_byte != AF_INET) continue;
+            const sa: [*]const u8 = @ptrCast(@alignCast(addr_ptr));
+            if (sa[1] != AF_INET) continue; // sa_family（与旧实现同判位）
 
-            const addr_u32_ptr: *align(1) const u32 = @ptrCast(
-                @as([*]const u8, @ptrCast(@alignCast(addr_ptr))) + 4,
-            );
-            if (addr_u32_ptr.* != ip_nbo) continue;
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(ifa.name)), 0);
+            if (!std.mem.startsWith(u8, name, "en") and !std.mem.startsWith(u8, name, "pdp_ip")) continue;
+            if (name.len > 15) continue;
 
-            const name_z: [*:0]const u8 = @ptrCast(ifa.name);
-            const index: u32 = @intCast(std.c.if_nametoindex(name_z));
-            return index;
+            var slot: ?usize = null;
+            for (lens[0..n], 0..) |l, i| {
+                if (l == name.len and std.mem.eql(u8, names[i][0..l], name)) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == null) {
+                if (n >= N) continue;
+                slot = n;
+                @memcpy(names[n][0..name.len], name);
+                lens[n] = name.len;
+                n += 1;
+            }
+            const s = slot.?;
+
+            const IFF_UP: u32 = 0x1;
+            if (ifa.flags & IFF_UP != 0) is_up[s] = true;
+
+            // sockaddr_in: sin_addr 在偏移 4..8；排除链路本地 169.254/16（主机序）
+            const host: u32 = foundation.endian.readIntBig(u32, sa[4..8]);
+            if ((host & 0xFFFF_0000) != 0xA9FE_0000) has_v4[s] = true;
         }
-        return error.InterfaceNotFound;
+
+        // 选择序：en*（字典序小者优先，en0 < en1）→ pdp_ip*；候选须 UP 且有有效 v4
+        var best: ?usize = null;
+        for (is_up[0..n], has_v4[0..n], 0..) |up, v4ok, i| {
+            if (!up or !v4ok) continue;
+            if (best) |b| {
+                const b_wifi = lens[b] >= 2 and names[b][0] == 'e'; // en* 前缀
+                const i_wifi = lens[i] >= 2 and names[i][0] == 'e';
+                if (b_wifi and !i_wifi) continue;
+                if (b_wifi == i_wifi) {
+                    const ord = std.mem.order(u8, names[b][0..lens[b]], names[i][0..lens[i]]);
+                    if (ord != .gt) continue;
+                }
+            }
+            best = i;
+        }
+        const s = best orelse return null;
+
+        var name_z_buf: [17]u8 = undefined;
+        @memcpy(name_z_buf[0..lens[s]], names[s][0..lens[s]]);
+        name_z_buf[lens[s]] = 0;
+        const idx = std.c.if_nametoindex(@ptrCast(&name_z_buf));
+        if (idx <= 0) return null;
+        return .{ .index = @intCast(idx), .name_buf = names[s], .name_len = lens[s] };
     }
 
     fn checkUpdateDarwin(self: *DefaultInterfaceMonitor) !void {
@@ -678,6 +694,16 @@ pub const DefaultInterfaceMonitor = struct {
 
             // 通过 index 查找接口 (参考 monitor_darwin.go:148)
             const if_index: u32 = hdr.rtm_index;
+
+            // 跳过 TUN 类接口的默认路由（2026-11-10 网络变化=完全重生重构：
+            // NE/auto_route 形态自身 utun 抓默认路由 → 旧实现选中自身 → 回调 →
+            // 重建 → 新 utun 又抓路由的自激励循环（macvm 09-12 实锚 13 次）。
+            // 物理出口语义下任何 utun/ppp 隧道都不是「我们的出口」——包括别人
+            // 的 VPN——darwin 上恒跳，与 appex 宿主探针 en*/pdp_ip* 判据同构）
+            {
+                const probe = self.interface_finder(if_index) catch continue;
+                if (types.classifyInterfaceName(probe.name) == .tun) continue;
+            }
 
             // 跳过排除接口自身 (避免路由循环; 支持多实例)
             var is_excluded = false;
