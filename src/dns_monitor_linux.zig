@@ -249,8 +249,9 @@ fn addResolvWatch(fd: c_int) c_int {
 
 /// stat resolv.conf mtime（纳秒）；文件缺失/不可读返回 null。
 fn statResolvMtime(io: std.Io) ?i128 {
-    const st = std.Io.Dir.cwd().statFile(io, ResolvPath, .{}) catch return null;
-    return @intCast(st.mtime.nanoseconds);
+    // Android<30：std.statFile 走 statx 撞 seccomp——走兼容层（其余平台透传）
+    const st = zf.platform.statAtCompat(io, .cwd(), ResolvPath) catch return null;
+    return st.mtime_ns;
 }
 
 /// mtime 兜底比较：null 表示文件缺失；null↔值转变也算变化。

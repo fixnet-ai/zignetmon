@@ -179,12 +179,13 @@ pub const HostsMonitor = struct {
     /// （改域名映射 / 换长度）仍恰报一次。每次成功读都刷新 last_mtime/last_size（供
     /// 上层 snapshot 读取当前文件状态）。
     fn pollOnce(self: *HostsMonitor, io: std.Io) void {
-        const st = std.Io.Dir.cwd().statFile(io, self.path, .{}) catch |err| {
+        // Android<30：std.statFile 走 statx 撞 seccomp——走兼容层（其余平台透传）
+        const st = zf.platform.statAtCompat(io, .cwd(), self.path) catch |err| {
             // 文件暂不可读（不存在/权限/正在被替换）：保留上次状态，等下一轮。
             std.log.debug("[hosts] statFile failed err={s} path={s}", .{ @errorName(err), self.path });
             return;
         };
-        const mtime: i128 = @intCast(st.mtime.nanoseconds);
+        const mtime: i128 = st.mtime_ns;
 
         // stat 预筛：与上次基线一致 → 内容必未变（写入必更新 mtime），免读快速路径。
         var stat_changed = false;
@@ -199,7 +200,7 @@ pub const HostsMonitor = struct {
         if (have_baseline and !stat_changed) return; // 无变化，无需读内容
 
         // stat 变化（或首轮建基线）：读当前内容做内容 diff 确认。
-        const content = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(MaxHostsBytes)) catch |err| {
+        const content = zf.platform.readFileCompat(.cwd(), io, self.path, self.allocator, .limited(MaxHostsBytes)) catch |err| {
             // 读失败（瞬时被替换/权限/超限）：无法核对内容。首轮建基线失败 → 放弃、下轮
             // 重试（last_mtime 保持 null）；已有基线且 stat 变化 → 无法排除真变化，
             // fail-open 按变化 emit（宁多报不漏报真变化）。
