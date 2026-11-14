@@ -645,10 +645,16 @@ pub const DefaultInterfaceMonitor = struct {
             return error.SysctlFailed;
         }
 
-        // 遍历路由消息，找 index 最小 (metric 最低) 的默认路由
-        // (参考 monitor_darwin.go:128-163 — Go 遍历全部路由，选最小 index)
+        // 遍历路由消息收集 default 候选（2026-11-14 darwin-egress P4 改造：
+        // 「最低 rtm_index」判据被真机证伪——iOS NE 态 scoped default 顺序/序号
+        // 均无优先级语义（pdp_ip0 idx=8 < en0 idx=19 但 primary=en0）。新判据与
+        // zf.egress.getDefaultInterfaceViaRib 同源分层：unscoped 优先 → scoped
+        // 候选按 physicalEgressRank 名字序 tie-break（en* > bridge > pdp_ip*）。
+        // 证据：kiss 仓 .planning/2026-11-14-darwin-egress-research/findings.md）
         var offset: usize = 0;
-        var lowest_index: u32 = std.math.maxInt(u32);
+        var best_unscoped: ?NetworkInterface = null;
+        var best_scoped: ?NetworkInterface = null;
+        var best_scoped_rank: u8 = 255;
         var best_iface: ?NetworkInterface = null;
 
         while (offset + RTM_HEADER_SZ <= needed) {
@@ -715,10 +721,6 @@ pub const DefaultInterfaceMonitor = struct {
             }
             if (is_excluded) continue;
 
-            // 选 index 最小的 (参考 monitor_darwin.go:159-160 if if_index < lowestIndex)
-            if (if_index >= lowest_index) continue;
-            lowest_index = if_index;
-
             const if_info = self.interface_finder(if_index) catch continue;
 
             var iface = NetworkInterface{
@@ -727,8 +729,22 @@ pub const DefaultInterfaceMonitor = struct {
                 .name_len = @min(if_info.name.len, 63),
             };
             @memcpy(iface.name[0..iface.name_len], if_info.name);
-            best_iface = iface;
+
+            const IFSCOPE: i32 = 0x1000000; // net/route.h 实测（⚠️ 非 0x10000000=RTF_ROUTER）
+            const scoped = (hdr.rtm_flags & IFSCOPE) != 0;
+            if (!scoped) {
+                // 无 VPN 态：unscoped default 零歧义（恒首个即答）
+                if (best_unscoped == null) best_unscoped = iface;
+            } else {
+                // NE 态物理候选集：名字序 tie-break（同 rank 时保底取首个 = 原顺序）
+                const rank = foundation.egress.ifaceClassRank(if_info.name);
+                if (rank < best_scoped_rank) {
+                    best_scoped_rank = rank;
+                    best_scoped = iface;
+                }
+            }
         }
+        best_iface = best_unscoped orelse best_scoped;
 
         // 找到默认路由 → 检查并更新 (参考 monitor_darwin.go:172-175)
         if (best_iface) |new_iface| {
