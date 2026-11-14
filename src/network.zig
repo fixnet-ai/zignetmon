@@ -230,8 +230,15 @@ pub fn start() !void {
     // （2026-08-19 linuxvm 实机回归 gdb 定位）。started 已置位，失败路径
     // 由 close() 幂等清理兜底。
     g_state.update_monitor.start() catch |err| {
-        // 事件源不可用不致命——快照/注入通道仍可用
-        std.log.warn("[network] event monitor start failed: {s}", .{@errorName(err)});
+        // 事件源不可用不致命——快照/注入通道仍可用。NetlinkBanned 是 Android 11+
+        // 对非特权 app 的 RTM_GETLINK 恒禁（network_linux.zig 有据，回退 /proc/net/route
+        // 轮询）——预期平台路径降 info，防每次引擎启动必刷一条 W（2026-11-14 MI9
+        // 实锚：engine-*.log 每个文件第一条就是它）。
+        if (err == error.NetlinkBanned) {
+            std.log.info("[network] event monitor start failed: {s} (expected on Android 11+; /proc route polling fallback)", .{@errorName(err)});
+        } else {
+            std.log.warn("[network] event monitor start failed: {s}", .{@errorName(err)});
+        }
     };
     g_state.iface_monitor.start() catch |err| {
         // NoDefaultRoute 非致命（路由稍后出现），其余错误上抛
